@@ -59,6 +59,34 @@ struct ScanlineConfig {
   int64_t line = 0;
 };
 
+uint64_t refresh_ns_from_hz(double hz) {
+  if (!std::isfinite(hz) || hz <= 1.0)
+    return 16'666'666;
+
+  return static_cast<uint64_t>(std::llround(1'000'000'000.0 / hz));
+}
+
+uint64_t env_refresh_ns() {
+  // Optional manual refresh override for scanline mode. Without present-timing
+  // feedback Vulkan does not expose the physical scanout cadence to us.
+  double hz = env_double("VFC_SCANLINE_REFRESH_HZ", 0.0);
+  if (hz <= 0.0)
+    hz = env_double("VFC_REFRESH_HZ", 0.0);
+  return refresh_ns_from_hz(hz);
+}
+
+double env_clamped_double(const char* name, double fallback, double min_value, double max_value) {
+  double value = env_double(name, fallback);
+  if (!std::isfinite(value))
+    return fallback;
+  return std::clamp(value, min_value, max_value);
+}
+
+Ns env_microseconds(const char* name, double fallback_us) {
+  return std::chrono::duration_cast<Ns>(std::chrono::duration<double, std::micro>(
+      env_double(name, fallback_us)));
+}
+
 ScanlineConfig env_scanline() {
   const char* v = std::getenv("SCANLINE");
   if (!v || !*v)
@@ -75,10 +103,15 @@ ScanlineConfig env_scanline() {
 
 bool g_log = env_bool("VFC_LOG", false);
 ScanlineConfig g_scanline = env_scanline();
+uint64_t g_scanline_fallback_refresh_ns = env_refresh_ns();
+double g_scanline_vtotal_scale = env_clamped_double("VFC_SCANLINE_VTOTAL_SCALE", 1.05, 1.0, 1.30);
+Ns g_scanline_offset = env_microseconds("VFC_SCANLINE_OFFSET_US", 0.0);
+Ns g_scanline_acquire_margin = env_microseconds("VFC_SCANLINE_ACQUIRE_MARGIN_US", 750.0);
+Ns g_scanline_max_present_wait = env_microseconds("VFC_SCANLINE_MAX_PRESENT_WAIT_US", 4000.0);
 double g_target_fps = g_scanline.active ? 0.0 : env_double("FPS", 0.0);
 bool g_cap_active = !g_scanline.active && g_target_fps > 0.0 && std::isnormal(g_target_fps);
 // VK_EXT_present_timing feedback can freeze some games at launch (swapchain
-// timing flag / queue size). Opt-in only; scanline pacing works without it.
+// timing flag / queue size). Opt-in only; manual scanline pacing works without it.
 bool g_want_present_timing = g_scanline.active && env_bool("VFC_PRESENT_TIMING", false);
 
 void log(const char* fmt, ...) {
@@ -316,11 +349,13 @@ struct SwapchainState {
   uint64_t refresh_ns = 16'666'666;
   bool present_timing_requested = false;
   bool first_pixel_out_supported = false;
+  bool refresh_measured = false;
   bool scanline_logged = false;
   bool non_immediate_logged = false;
   Clock::time_point phase_base = Clock::time_point();
   Clock::time_point next_present_target = Clock::time_point();
   Clock::time_point last_acquire_done = Clock::time_point();
+  Clock::time_point last_refresh_query = Clock::time_point();
   Ns render_lead = std::chrono::milliseconds(3);
 };
 
@@ -445,9 +480,12 @@ SurfaceTimingCaps query_surface_timing_caps(DeviceDispatch* dev, VkSurfaceKHR su
   return result;
 }
 
-uint64_t query_swapchain_refresh_ns(DeviceDispatch* dev, VkSwapchainKHR swapchain) {
+uint64_t query_swapchain_refresh_ns(DeviceDispatch* dev, VkSwapchainKHR swapchain, bool* measured = nullptr) {
+  if (measured)
+    *measured = false;
+
   if (!dev || !dev->present_timing_enabled || !dev->GetSwapchainTimingPropertiesEXT)
-    return 16'666'666;
+    return g_scanline_fallback_refresh_ns;
 
   VkSwapchainTimingPropertiesEXT timing{};
   timing.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT;
@@ -455,26 +493,62 @@ uint64_t query_swapchain_refresh_ns(DeviceDispatch* dev, VkSwapchainKHR swapchai
 
   VkResult r = dev->GetSwapchainTimingPropertiesEXT(dev->device, swapchain, &timing, &counter);
   if (r != VK_SUCCESS || !timing.refreshDuration)
-    return 16'666'666;
+    return g_scanline_fallback_refresh_ns;
 
   if (timing.refreshInterval == UINT64_MAX)
     log("scanline: VRR-like refresh interval reported; fixed scanline sync may be unstable");
 
+  if (measured)
+    *measured = true;
   return timing.refreshDuration;
+}
+
+Ns scanline_default_render_lead(uint64_t refresh_ns) {
+  Ns refresh(static_cast<int64_t>(refresh_ns ? refresh_ns : g_scanline_fallback_refresh_ns));
+  return std::clamp(std::chrono::duration_cast<Ns>(std::chrono::milliseconds(3)),
+      std::chrono::duration_cast<Ns>(std::chrono::microseconds(250)), refresh / 2);
+}
+
+Ns scanline_max_render_lead(uint64_t refresh_ns) {
+  Ns refresh(static_cast<int64_t>(refresh_ns ? refresh_ns : g_scanline_fallback_refresh_ns));
+  Ns max_lead = refresh - std::chrono::microseconds(1000);
+  return std::max(max_lead, std::chrono::duration_cast<Ns>(std::chrono::microseconds(250)));
+}
+
+Ns positive_mod(Ns value, Ns period) {
+  if (period <= Ns::zero())
+    return Ns::zero();
+
+  int64_t rem = value.count() % period.count();
+  if (rem < 0)
+    rem += period.count();
+  return Ns(rem);
+}
+
+Ns scanline_offset_for_state(const SwapchainState& state) {
+  uint32_t height = std::max(1u, state.extent.height);
+  Ns refresh(static_cast<int64_t>(state.refresh_ns ? state.refresh_ns : g_scanline_fallback_refresh_ns));
+  long double vtotal = std::max<long double>(1.0L,
+      static_cast<long double>(height) * static_cast<long double>(g_scanline_vtotal_scale));
+  auto scanline_ns = Ns(static_cast<int64_t>(std::llround(
+      static_cast<long double>(refresh.count()) * static_cast<long double>(g_scanline.line) / vtotal)));
+
+  // Normalize to one refresh. Negative scanlines intentionally wrap to the end
+  // of the previous refresh, which is how users hide the tearline near vblank.
+  return positive_mod(scanline_ns + g_scanline_offset, refresh);
 }
 
 Clock::time_point scanline_compute_target_locked(SwapchainState& state, Clock::time_point now) {
   uint32_t height = std::max(1u, state.extent.height);
-  Ns refresh(static_cast<int64_t>(state.refresh_ns ? state.refresh_ns : 16'666'666));
-  Ns offset(static_cast<int64_t>(std::llround(
-      static_cast<long double>(refresh.count()) * static_cast<long double>(g_scanline.line) /
-      static_cast<long double>(height))));
+  Ns refresh(static_cast<int64_t>(state.refresh_ns ? state.refresh_ns : g_scanline_fallback_refresh_ns));
+  Ns offset = scanline_offset_for_state(state);
 
   if (!state.scanline_logged) {
-    log("scanline sync active: line=%lld height=%u refresh=%llu ns present_mode=%d timing=%d first_pixel_out=%d",
-        static_cast<long long>(g_scanline.line), height,
-        static_cast<unsigned long long>(state.refresh_ns), state.present_mode,
-        state.present_timing_requested, state.first_pixel_out_supported);
+    log("scanline sync active: line=%lld height=%u vtotal_scale=%.3f offset=%lld us refresh=%llu ns measured=%d present_mode=%d timing=%d first_pixel_out=%d",
+        static_cast<long long>(g_scanline.line), height, g_scanline_vtotal_scale,
+        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(offset).count()),
+        static_cast<unsigned long long>(state.refresh_ns), state.refresh_measured,
+        state.present_mode, state.present_timing_requested, state.first_pixel_out_supported);
     state.scanline_logged = true;
   }
 
@@ -485,12 +559,15 @@ Clock::time_point scanline_compute_target_locked(SwapchainState& state, Clock::t
   }
 
   if (state.phase_base == Clock::time_point())
-    state.phase_base = now - offset;
+    state.phase_base = now;
 
   Clock::time_point target = state.phase_base + offset;
-  while (target <= now) {
-    state.phase_base += refresh;
-    target += refresh;
+  if (target <= now) {
+    auto late = std::chrono::duration_cast<Ns>(now - target);
+    int64_t periods = late.count() / refresh.count() + 1;
+    Ns advance(refresh.count() * periods);
+    state.phase_base += advance;
+    target += advance;
   }
 
   state.next_present_target = target;
@@ -513,18 +590,24 @@ void scanline_acquire_delay(DeviceDispatch* dev, VkSwapchainKHR swapchain) {
     SwapchainState& state = it->second;
     // Lazily re-query refresh duration: some drivers only populate it after
     // the first few presents, so the initial value may still be the fallback.
-    if (state.present_timing_requested && state.refresh_ns == 16'666'666) {
-      uint64_t measured = query_swapchain_refresh_ns(dev, swapchain);
-      if (measured && measured != 16'666'666) {
-        state.refresh_ns = measured;
-        log("scanline: measured refresh %llu ns", static_cast<unsigned long long>(measured));
+    if (state.present_timing_requested && !state.refresh_measured &&
+        (state.last_refresh_query == Clock::time_point() || now - state.last_refresh_query > std::chrono::seconds(1))) {
+      state.last_refresh_query = now;
+      bool measured = false;
+      uint64_t refresh_ns = query_swapchain_refresh_ns(dev, swapchain, &measured);
+      if (measured) {
+        state.refresh_ns = refresh_ns;
+        state.refresh_measured = true;
+        state.render_lead = std::min(state.render_lead, scanline_max_render_lead(state.refresh_ns));
+        state.scanline_logged = false;
+        log("scanline: measured refresh %llu ns", static_cast<unsigned long long>(refresh_ns));
       }
     }
     Clock::time_point target = scanline_compute_target_locked(state, now);
     // Start rendering based on measured acquire->present time. This keeps the
     // input-lag win of frame-start pacing while adapting enough lead time to
     // avoid missing the target scanline and causing jumps.
-    wake = target - state.render_lead - std::chrono::microseconds(750);
+    wake = target - state.render_lead - g_scanline_acquire_margin;
   }
 
   if (wake > now)
@@ -628,8 +711,8 @@ void scanline_present_delay(DeviceDispatch* dev,
     if (state.last_acquire_done != Clock::time_point() && now > state.last_acquire_done) {
       Ns measured = std::chrono::duration_cast<Ns>(now - state.last_acquire_done);
       measured = std::clamp(measured,
-          std::chrono::duration_cast<Ns>(std::chrono::microseconds(500)),
-          std::chrono::duration_cast<Ns>(std::chrono::milliseconds(14)));
+          std::chrono::duration_cast<Ns>(std::chrono::microseconds(250)),
+          scanline_max_render_lead(state.refresh_ns));
       state.render_lead = Ns((state.render_lead.count() * 9 + measured.count()) / 10);
     }
 
@@ -638,9 +721,10 @@ void scanline_present_delay(DeviceDispatch* dev,
       target = scanline_compute_target_locked(state, now);
   }
 
-  // Only wait a tiny amount at present time. If rendering missed the target by
-  // more than this, present immediately instead of adding a whole-refresh stall.
-  if (target > now && target - now <= std::chrono::milliseconds(4))
+  // Most waiting should happen at acquire/frame start. This final wait is only
+  // a correction; cap it to avoid a whole-refresh stall if the frame missed the
+  // target badly.
+  if (target > now && target - now <= g_scanline_max_present_wait)
     DxvkStyleSleep::sleep_until(now, target);
 }
 
@@ -1174,6 +1258,7 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL vkCreateSwapchainKHR(
     SwapchainState state{};
     state.present_mode = create_info.presentMode;
     state.extent = create_info.imageExtent;
+    state.refresh_ns = g_scanline_fallback_refresh_ns;
     state.present_timing_requested = !!(create_info.flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT);
     state.first_pixel_out_supported = timing_caps.first_pixel_out;
     if (g_scanline.active && state.present_timing_requested) {
@@ -1182,8 +1267,11 @@ VK_LAYER_EXPORT VkResult VKAPI_CALL vkCreateSwapchainKHR(
         if (qr != VK_SUCCESS)
           log("scanline: vkSetSwapchainPresentTimingQueueSizeEXT returned %d", qr);
       }
-      state.refresh_ns = query_swapchain_refresh_ns(dev, *pSwapchain);
+      bool measured = false;
+      state.refresh_ns = query_swapchain_refresh_ns(dev, *pSwapchain, &measured);
+      state.refresh_measured = measured;
     }
+    state.render_lead = scanline_default_render_lead(state.refresh_ns);
 
     std::lock_guard<std::mutex> lock(dev->present_mutex);
     dev->present_modes[*pSwapchain] = create_info.presentMode;

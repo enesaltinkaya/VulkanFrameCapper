@@ -66,7 +66,11 @@ Uninstall:
 - `FPS=60` target FPS. Fractional values like `59.94` work. `0` or unset disables capping. Default: disabled.
 - `SCANLINE=500` enables experimental RTSS-like scanline path instead of the normal FPS limiter. Integer values only. Examples: `SCANLINE=-50`, `SCANLINE=500`.
 - `VFC_PRESENT_WAIT=1` use `VK_KHR_present_wait` when available. Default: `1` when FPS cap is active.
-- `VFC_PRESENT_TIMING=1` (scanline mode) opt into `VK_EXT_present_timing` feedback. **Experimental, may freeze some games at launch.** Default: `0`.
+- `VFC_PRESENT_TIMING=1` (scanline mode) opt into `VK_EXT_present_timing` for refresh timing. **Experimental, may freeze some games at launch.** Default: `0`.
+- `VFC_SCANLINE_REFRESH_HZ=144` manual fixed-refresh override for scanline mode when present timing is off/unavailable. Default fallback: `60`.
+- `VFC_SCANLINE_OFFSET_US=0` manual phase calibration. Change this if the tearline is stable but shifted from the requested line.
+- `VFC_SCANLINE_VTOTAL_SCALE=1.05` estimated total vertical size including blanking. Default: `1.05`.
+- `VFC_SCANLINE_MAX_PRESENT_WAIT_US=4000` maximum final wait inside `vkQueuePresentKHR`; most waiting is done at acquire.
 - `VFC_LOG=1` print debug logs to stderr. Default: `0`.
 - `DISABLE_VULKAN_FRAME_CAPPER=1` disables the implicit layer.
 
@@ -95,11 +99,11 @@ Current prototype behavior:
 - forces `VK_PRESENT_MODE_IMMEDIATE_KHR` when available
 - paces most of the wait at frame start (`vkAcquireNextImageKHR`), with a small final correction before present, for low input lag
 - adaptively learns the render lead time to keep the tearline stable
-- maps `SCANLINE` to a phase inside the frame using the swapchain height
-- negative values target a phase before the top of the visible frame
-- auto-enables `VK_EXT_present_timing` (+ `present_id2`, `calibrated_timestamps`, `get_surface_capabilities2`) when supported to get real refresh + first-pixel-out feedback
+- maps `SCANLINE` to a refresh phase using the swapchain height and `VFC_SCANLINE_VTOTAL_SCALE`
+- negative values wrap near the end of the refresh, useful for hiding the tearline near vblank
+- can opt into `VK_EXT_present_timing` (+ `present_id2`, `calibrated_timestamps`, `get_surface_capabilities2`) for refresh-duration detection
 
-This requires fullscreen/direct-scanout/tearing support to produce a stable visible tearline. On a composited window, present-timing feedback is usually unavailable.
+This requires fullscreen/direct-scanout/tearing support to produce a stable visible tearline. Without present-timing feedback, `SCANLINE` is manually tunable rather than physically absolute; use `VFC_SCANLINE_OFFSET_US` if the tearline is consistently shifted.
 
 ## Notes
 
