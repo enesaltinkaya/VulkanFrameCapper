@@ -1,0 +1,17 @@
+{
+  "file_format_version": "1.2.0",
+  "layer": {
+    "name": "VK_LAYER_MEIN_frame_capper",
+    "type": "GLOBAL",
+    "library_path": "@VFC_LIBRARY_PATH@",
+    "api_version": "1.4.0",
+    "implementation_version": "1",
+    "description": "Experimental Vulkan FPS capper using a DXVK-style late limiter",
+    "functions": {
+      "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
+    },
+    "disable_environment": {
+      "DISABLE_VULKAN_FRAME_CAPPER": "1"
+    }
+  }
+}
