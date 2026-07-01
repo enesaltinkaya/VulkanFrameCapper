@@ -1,18 +1,50 @@
-#include <vulkan/vulkan.h>
+// =============================================================================
+// VulkanFrameCapper — a Vulkan layer that implements the two modes described in
+// scanline-sync.md:
+//
+//   Mode 1: low-latency frame limiter (FPS=N)
+//           paces the start of each frame at acquire so no queue builds up.
+//
+//   Mode 2: experimental scanline sync (SCANLINE=N), RTSS-like.
+//           forces VK_PRESENT_MODE_IMMEDIATE_KHR, pins the tear line to a chosen
+//           vertical position by timing vkQueuePresentKHR against the display's
+//           scanout phase. Uses VK_EXT_present_timing first-pixel-out feedback
+//           to phase-lock when available; falls back to manual tuning otherwise.
+//
+// Core algorithm (per scanline-sync.md):
+//
+//   refresh_ns            = 1e9 / refresh_hz   (measured via present_timing)
+//   vtotal                = visible_height * vtotal_scale   (includes blanking)
+//   scanline_offset_ns    = refresh_ns * scanline / vtotal  (wrapped to [0,T))
+//   target_flip_time      = phase_base + scanline_offset_ns     (first-pixel-out)
+//   desired_present_call  = target_flip_time - present_latency  (call->first-pixel)
+//   desired_acquire_wake  = desired_present_call - render_lead - acquire_margin
+//
+//   sleep_until(desired_acquire_wake - sleep_margin)
+//   busy_wait_until(desired_acquire_wake)          // at vkAcquireNextImageKHR
+//   ... render ...
+//   busy_wait_until(desired_present_call)          // at vkQueuePresentKHR (capped)
+//
+// phase_base and present_latency are corrected by a PLL using first-pixel-out
+// feedback from VK_EXT_present_timing.
+// =============================================================================
+
 #include <vulkan/vk_layer.h>
+#include <vulkan/vulkan.h>
 
 #include "key_input.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cstdarg>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
-#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <memory>
+#include <ctime>
 #include <mutex>
 #include <string>
 #include <strings.h>
@@ -24,1421 +56,1842 @@
 #define VK_LAYER_EXPORT __attribute__((visibility("default")))
 #endif
 
-extern "C" VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* pName);
-extern "C" VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* pName);
-extern "C" VK_LAYER_EXPORT VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface* pVersionStruct);
-
 namespace {
 
 using Clock = std::chrono::steady_clock;
 using Ns = std::chrono::nanoseconds;
+using Sec = std::chrono::seconds;
 
-bool env_bool(const char* name, bool fallback) {
-  const char* v = std::getenv(name);
+// =============================================================================
+// Section 1 — environment / configuration
+// =============================================================================
+
+bool env_bool(const char *name, bool fallback) {
+  const char *v = std::getenv(name);
   if (!v || !*v)
     return fallback;
-
-  return std::strcmp(v, "0") != 0
-      && strcasecmp(v, "false") != 0
-      && strcasecmp(v, "no") != 0
-      && strcasecmp(v, "off") != 0;
+  return std::strcmp(v, "0") != 0 && strcasecmp(v, "false") != 0 &&
+         strcasecmp(v, "no") != 0 && strcasecmp(v, "off") != 0;
 }
 
-double env_double(const char* name, double fallback) {
-  const char* v = std::getenv(name);
+double env_double(const char *name, double fallback) {
+  const char *v = std::getenv(name);
   if (!v || !*v)
     return fallback;
-
-  char* end = nullptr;
+  char *end = nullptr;
   double d = std::strtod(v, &end);
-  return end && end != v ? d : fallback;
+  if (end == v)
+    return fallback;
+  return d;
 }
 
-struct ScanlineConfig {
-  bool active = false;
-  int64_t line = 0;
+int64_t env_int(const char *name, int64_t fallback) {
+  const char *v = std::getenv(name);
+  if (!v || !*v)
+    return fallback;
+  char *end = nullptr;
+  long long ll = std::strtoll(v, &end, 10);
+  if (end == v)
+    return fallback;
+  return static_cast<int64_t>(ll);
+}
+
+// Parse a duration in microseconds, clamped to [lo, hi], returned in ns.
+Ns env_us(const char *name, double fallback_us, double lo_us, double hi_us) {
+  double v = std::clamp(env_double(name, fallback_us), lo_us, hi_us);
+  return std::chrono::nanoseconds(static_cast<int64_t>(v * 1000.0));
+}
+
+double env_clamped(const char *name, double fallback, double lo, double hi) {
+  return std::clamp(env_double(name, fallback), lo, hi);
+}
+
+uint64_t hz_to_ns(double hz) {
+  if (hz <= 0.0 || !std::isnormal(hz))
+    return 0;
+  return static_cast<uint64_t>(1.0e9 / hz);
+}
+
+enum class Mode { Off, FpsLimit, ScanlineSync };
+
+struct Config {
+  Mode mode = Mode::Off;
+
+  // Mode 1
+  double target_fps = 0.0;
+
+  // Mode 2
+  int64_t scanline = 0;
+  Ns manual_offset = Ns::zero();
+  Ns fallback_refresh = Ns::zero();
+  double vtotal_scale = 1.05;
+  bool force_immediate = true;
+
+  // shared / pacing
+  bool want_present_timing = false;   // attempt VK_EXT_present_timing feedback
+  bool want_present_wait = false;     // opt into VK_KHR_present_wait
+  Ns acquire_margin = Ns::zero();     // slack between acquire wake and present
+  Ns max_present_wait = Ns::zero();   // cap on the final present-time busy wait
+  Ns sleep_margin = Ns::zero();       // handoff from nanosleep to busy spin
+  Ns busy_window = Ns::zero();        // final busy-spin duration
+  double pll_strength = 0.0;          // PLL correction gain on phase_base
+  Ns pll_max_step = Ns::zero();       // clamp on a single PLL step
+  double latency_alpha = 0.0;         // EWMA gain for present_latency
+  double render_alpha = 0.0;          // EWMA gain for render_lead
+
+  // guards
+  bool disable_when_vrr = true;
+  Ns disable_jitter = Ns::zero();
+
+  bool log = false;
 };
 
-uint64_t refresh_ns_from_hz(double hz) {
-  if (!std::isfinite(hz) || hz <= 1.0)
-    return 16'666'666;
+Config parse_config() {
+  Config c;
+  c.log = env_bool("VFC_LOG", false);
 
-  return static_cast<uint64_t>(std::llround(1'000'000'000.0 / hz));
+  int64_t scanline = env_int("SCANLINE", 0);
+  const char *sv = std::getenv("SCANLINE");
+  bool scanline_set = sv && *sv;
+  double fps = env_double("FPS", 0.0);
+
+  if (scanline_set)
+    c.mode = Mode::ScanlineSync;
+  else if (fps > 0.0 && std::isnormal(fps))
+    c.mode = Mode::FpsLimit;
+  else
+    c.mode = Mode::Off;
+
+  c.target_fps = fps;
+  c.scanline = scanline;
+  c.manual_offset = env_us("VFC_SCANLINE_OFFSET_US", 0.0, -1'000'000.0, 1'000'000.0);
+  c.fallback_refresh = Ns(static_cast<int64_t>(hz_to_ns(
+      env_clamped("VFC_SCANLINE_REFRESH_HZ", 60.0, 1.0, 1000.0))));
+  c.vtotal_scale = env_clamped("VFC_SCANLINE_VTOTAL_SCALE", 1.05, 1.0, 1.30);
+  c.force_immediate = env_bool("VFC_FORCE_IMMEDIATE", true);
+
+  // present_timing feedback is opt-in: the doc warns it can freeze some drivers
+  // at launch. Manual scanline pacing (phase model + manual offset) works
+  // without it.
+  // present_timing feedback defaults to ON in scanline mode. The layer
+  // auto-disables it where the driver's create flag crashes (RADV), so it's
+  // safe to attempt unconditionally.
+  c.want_present_timing = c.mode == Mode::ScanlineSync;
+  c.want_present_wait = env_bool("VFC_PRESENT_WAIT",
+                                 c.mode != Mode::Off);
+
+  c.acquire_margin = env_us("VFC_SCANLINE_ACQUIRE_MARGIN_US", 750.0, 0.0, 100'000.0);
+  c.max_present_wait = env_us("VFC_SCANLINE_MAX_PRESENT_WAIT_US", 4000.0, 0.0, 100'000.0);
+  c.sleep_margin = env_us("VFC_SLEEP_MARGIN_US", 1000.0, 0.0, 100'000.0);
+  c.busy_window = env_us("VFC_BUSY_WAIT_US", 200.0, 0.0, 100'000.0);
+  c.pll_strength = env_clamped("VFC_SCANLINE_PLL_STRENGTH", 0.05, 0.0, 1.0);
+  c.pll_max_step = env_us("VFC_SCANLINE_MAX_PLL_STEP_US", 200.0, 0.0, 1'000'000.0);
+  c.latency_alpha = env_clamped("VFC_SCANLINE_LATENCY_ALPHA", 0.10, 0.0, 1.0);
+  c.render_alpha = env_clamped("VFC_SCANLINE_RENDER_ALPHA", 0.02, 0.0, 1.0);
+
+  c.disable_when_vrr = env_bool("VFC_DISABLE_WHEN_VRR", true);
+  c.disable_jitter = env_us("VFC_DISABLE_WHEN_JITTER_ABOVE_US", 500.0, 0.0, 1'000'000.0);
+
+  return c;
 }
 
-uint64_t env_refresh_ns() {
-  // Optional manual refresh override for scanline mode. Without present-timing
-  // feedback Vulkan does not expose the physical scanout cadence to us.
-  double hz = env_double("VFC_SCANLINE_REFRESH_HZ", 0.0);
-  if (hz <= 0.0)
-    hz = env_double("VFC_REFRESH_HZ", 0.0);
-  return refresh_ns_from_hz(hz);
-}
+Config g_cfg = parse_config();
 
-double env_clamped_double(const char* name, double fallback, double min_value, double max_value) {
-  double value = env_double(name, fallback);
-  if (!std::isfinite(value))
-    return fallback;
-  return std::clamp(value, min_value, max_value);
-}
+// Live FPS cap (adjustable via hotkeys). Inactive in scanline mode.
+std::atomic<double> g_live_fps{g_cfg.mode == Mode::FpsLimit ? g_cfg.target_fps : 0.0};
+// Live scanline offset calibration (adjustable via hotkeys).
+std::atomic<int64_t> g_live_offset_ns{g_cfg.manual_offset.count()};
 
-Ns env_microseconds(const char* name, double fallback_us) {
-  return std::chrono::duration_cast<Ns>(std::chrono::duration<double, std::micro>(
-      env_double(name, fallback_us)));
-}
+// =============================================================================
+// Section 2 — logging
+// =============================================================================
 
-ScanlineConfig env_scanline() {
-  const char* v = std::getenv("SCANLINE");
-  if (!v || !*v)
-    return {};
-
-  errno = 0;
-  char* end = nullptr;
-  long long line = std::strtoll(v, &end, 10);
-  if (errno || end == v || (end && *end))
-    return {};
-
-  return {true, static_cast<int64_t>(line)};
-}
-
-bool g_log = env_bool("VFC_LOG", false);
-ScanlineConfig g_scanline = env_scanline();
-uint64_t g_scanline_fallback_refresh_ns = env_refresh_ns();
-double g_scanline_vtotal_scale = env_clamped_double("VFC_SCANLINE_VTOTAL_SCALE", 1.05, 1.0, 1.30);
-Ns g_scanline_offset = env_microseconds("VFC_SCANLINE_OFFSET_US", 0.0);
-Ns g_scanline_acquire_margin = env_microseconds("VFC_SCANLINE_ACQUIRE_MARGIN_US", 750.0);
-Ns g_scanline_max_present_wait = env_microseconds("VFC_SCANLINE_MAX_PRESENT_WAIT_US", 4000.0);
-double g_target_fps = g_scanline.active ? 0.0 : env_double("FPS", 0.0);
-bool g_cap_active = !g_scanline.active && g_target_fps > 0.0 && std::isnormal(g_target_fps);
-// VK_EXT_present_timing feedback can freeze some games at launch (swapchain
-// timing flag / queue size). Opt-in only; manual scanline pacing works without it.
-bool g_want_present_timing = g_scanline.active && env_bool("VFC_PRESENT_TIMING", false);
-
-void log(const char* fmt, ...) {
-  if (!g_log)
+void log(const char *fmt, ...) {
+  if (!g_cfg.log)
     return;
-
   va_list args;
   va_start(args, fmt);
-  std::fprintf(stderr, "[VulkanFrameCapper] ");
+  std::fputs("[VulkanFrameCapper] ", stderr);
   std::vfprintf(stderr, fmt, args);
-  std::fprintf(stderr, "\n");
+  std::fputc('\n', stderr);
   va_end(args);
+  std::fflush(stderr);
 }
 
-class DxvkStyleSleep {
+// =============================================================================
+// Section 3 — DXVK-style sleep (coarse nanosleep + final busy spin)
+//
+// Mirrors the doc's:
+//   sleep_until(target_present_time - safety_margin);
+//   busy_wait_until(target_present_time);
+// =============================================================================
+
+class Sleeper {
 public:
-  static Clock::time_point sleep_until(Clock::time_point t0, Clock::time_point t1) {
-    return sleep_for(t0, std::chrono::duration_cast<Ns>(t1 - t0));
-  }
-
-private:
-  static Clock::time_point sleep_for(Clock::time_point t0, Ns duration) {
-    if (duration <= Ns::zero())
-      return t0;
-
-    // DXVK assumes 0.5 ms granularity on non-Windows and busy-waits
-    // the final part for better timing accuracy.
-    constexpr Ns sleep_granularity = std::chrono::duration_cast<Ns>(std::chrono::microseconds(500));
-    Ns sleep_threshold = 4 * sleep_granularity;
-    sleep_threshold += duration / 6;
-
-    Ns remaining = duration;
-    Clock::time_point t1 = t0;
-
-    while (remaining > sleep_threshold) {
-      std::this_thread::sleep_for(remaining - sleep_threshold);
-
-      t1 = Clock::now();
-      remaining -= std::chrono::duration_cast<Ns>(t1 - t0);
-      t0 = t1;
-    }
-
-    while (remaining > Ns::zero()) {
-      t1 = Clock::now();
-      remaining -= std::chrono::duration_cast<Ns>(t1 - t0);
-      t0 = t1;
-    }
-
-    return t1;
-  }
-};
-
-class FpsLimiter {
-public:
-  FpsLimiter() {
-    set_fps(g_target_fps);
-  }
-
-  void set_fps(double fps) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    set_fps_locked(fps);
-  }
-
-  void adjust(double delta) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    set_fps_locked(std::max(0.0, m_fps + delta));
-  }
-
-  bool enabled() {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    return m_interval != Ns::zero();
-  }
-
-  void delay() {
-    std::unique_lock<std::mutex> lock(m_mutex);
-    auto interval = m_interval;
-
-    if (interval == Ns::zero()) {
-      m_next_frame = Clock::time_point();
+  // Sleep from t0 until target. A coarse clock_nanosleep runs up to
+  // (target - busy_window); the remainder is a tight spin loop for accuracy.
+  static void wait_until(Clock::time_point target, Ns busy_window) {
+    auto now = Clock::now();
+    if (target <= now)
       return;
+
+    Clock::time_point handoff = target - busy_window;
+    if (handoff > now) {
+      // Coarse sleep in slices; clock_nanosleep may return early on signal.
+      timespec ts{};
+      while (true) {
+        now = Clock::now();
+        if (now >= handoff)
+          break;
+        Ns remaining = std::chrono::duration_cast<Ns>(handoff - now);
+        Ns slice = std::min<Ns>(remaining, std::chrono::milliseconds(4));
+        ts.tv_sec = static_cast<time_t>(
+            std::chrono::duration_cast<Sec>(slice).count());
+        ts.tv_nsec = static_cast<long>(slice.count() % 1'000'000'000LL);
+        clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, nullptr);
+      }
     }
 
-    auto t1 = Clock::now();
-    auto next_frame = m_next_frame;
-
-    // Same structure as DXVK: unlock while sleeping, then update the
-    // absolute next-frame schedule based on the pre-sleep timestamp.
-    lock.unlock();
-
-    if (t1 < next_frame)
-      DxvkStyleSleep::sleep_until(t1, next_frame);
-
-    lock.lock();
-    m_next_frame = (t1 < m_next_frame + interval)
-      ? m_next_frame + interval
-      : t1 + interval;
+    // Final busy spin.
+    while (Clock::now() < target)
+      std::this_thread::yield();
   }
-
-private:
-  void set_fps_locked(double fps) {
-    m_fps = fps > 0.0 && std::isnormal(fps) ? fps : 0.0;
-
-    if (m_fps > 0.0)
-      m_interval = Ns(int64_t(1'000'000'000.0 / m_fps));
-    else
-      m_interval = Ns::zero();
-
-    m_next_frame = Clock::time_point();
-    log("FPS limit %.2f (%lld ns)", m_fps, static_cast<long long>(m_interval.count()));
-  }
-
-  std::mutex m_mutex;
-  double m_fps = 0.0;
-  Ns m_interval = Ns::zero();
-  Clock::time_point m_next_frame = Clock::time_point();
 };
 
-FpsLimiter g_limiter;
-bool g_want_present_wait = g_cap_active && env_bool("VFC_PRESENT_WAIT", true);
-
-struct HotkeyState {
-  bool held = false;
-  Clock::time_point first_press = Clock::time_point();
-  Clock::time_point last_action = Clock::time_point();
-};
-
-bool hotkey_should_fire(bool pressed, HotkeyState& state, Clock::time_point now) {
-  using namespace std::chrono_literals;
-
-  if (!pressed) {
-    state.held = false;
-    return false;
-  }
-
-  if (!state.held) {
-    state.held = true;
-    state.first_press = now;
-    state.last_action = now;
-    return true;
-  }
-
-  if (now - state.first_press >= 400ms && now - state.last_action >= 100ms) {
-    state.last_action = now;
-    return true;
-  }
-
-  return false;
-}
-
-void check_hotkeys() {
-  using namespace std::chrono_literals;
-
-  static Clock::time_point last_poll = Clock::time_point();
-  static HotkeyState increase_state;
-  static HotkeyState decrease_state;
-  static HotkeyState increase_fast_state;
-  static HotkeyState decrease_fast_state;
-
-  auto now = Clock::now();
-  if (now - last_poll < 50ms)
-    return;
-  last_poll = now;
-
-  bool increase_fast = vfc::key_input::increase_fast_pressed();
-  bool decrease_fast = vfc::key_input::decrease_fast_pressed();
-
-  if (hotkey_should_fire(increase_fast, increase_fast_state, now))
-    g_limiter.adjust(+0.10);
-
-  if (hotkey_should_fire(decrease_fast, decrease_fast_state, now))
-    g_limiter.adjust(-0.10);
-
-  // Ctrl+Plus on many layouts is physically Ctrl+Shift+=, so suppress
-  // the Shift+Plus 0.01 hotkey while the Ctrl hotkey is active.
-  if (hotkey_should_fire(!increase_fast && vfc::key_input::increase_pressed(), increase_state, now))
-    g_limiter.adjust(+0.01);
-
-  if (hotkey_should_fire(!decrease_fast && vfc::key_input::decrease_pressed(), decrease_state, now))
-    g_limiter.adjust(-0.01);
-}
-
-template <typename T>
-const T* find_pnext(const void* pNext, VkStructureType sType) {
-  auto* base = reinterpret_cast<const VkBaseInStructure*>(pNext);
-  while (base) {
-    if (base->sType == sType)
-      return reinterpret_cast<const T*>(base);
-    base = base->pNext;
-  }
-  return nullptr;
-}
-
-bool has_extension(const std::vector<VkExtensionProperties>& exts, const char* name) {
-  return std::any_of(exts.begin(), exts.end(), [name](const VkExtensionProperties& e) {
-    return std::strcmp(e.extensionName, name) == 0;
-  });
-}
-
-bool name_in_list(const char* name, uint32_t count, const char* const* names) {
-  for (uint32_t i = 0; i < count; i++)
-    if (names[i] && std::strcmp(names[i], name) == 0)
-      return true;
-  return false;
-}
-
-template <typename T>
-T get_layer_link_info(const void* pNext, VkLayerFunction func, VkStructureType type) {
-  auto* chain = reinterpret_cast<const VkLayerInstanceCreateInfo*>(pNext);
-  while (chain) {
-    if (chain->sType == type && chain->function == func)
-      return reinterpret_cast<T>(const_cast<VkLayerInstanceCreateInfo*>(chain));
-    chain = reinterpret_cast<const VkLayerInstanceCreateInfo*>(chain->pNext);
-  }
-  return nullptr;
-}
-
-struct InstanceDispatch {
-  VkInstance instance = VK_NULL_HANDLE;
-  PFN_vkGetInstanceProcAddr GetInstanceProcAddr = nullptr;
-  PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
-  PFN_vkDestroyInstance DestroyInstance = nullptr;
-  PFN_vkCreateDevice CreateDevice = nullptr;
-  PFN_vkEnumeratePhysicalDevices EnumeratePhysicalDevices = nullptr;
-  PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2 = nullptr;
-  PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties = nullptr;
-  PFN_vkGetPhysicalDeviceSurfacePresentModesKHR GetPhysicalDeviceSurfacePresentModesKHR = nullptr;
-  PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR GetPhysicalDeviceSurfaceCapabilities2KHR = nullptr;
-  PFN_vkCreateWaylandSurfaceKHR CreateWaylandSurfaceKHR = nullptr;
-  PFN_vkDestroySurfaceKHR DestroySurfaceKHR = nullptr;
-};
+// =============================================================================
+// Section 4 — layer dispatch tables & swapchain state
+// =============================================================================
 
 struct SwapchainState {
-  VkPresentModeKHR present_mode = VK_PRESENT_MODE_MAX_ENUM_KHR;
-  VkExtent2D extent = {};
-  uint64_t refresh_ns = 16'666'666;
-  bool present_timing_requested = false;
-  bool first_pixel_out_supported = false;
+  // geometry / mode
+  uint32_t width = 0;
+  uint32_t height = 0;
+  VkPresentModeKHR present_mode = VK_PRESENT_MODE_FIFO_KHR;
+  bool immediate_active = false;
+  int64_t scanline = 0; // requested tearline position
+
+  // refresh
+  uint64_t refresh_ns = 0;     // measured or fallback
   bool refresh_measured = false;
-  bool scanline_logged = false;
-  bool non_immediate_logged = false;
-  Clock::time_point phase_base = Clock::time_point();
-  Clock::time_point next_present_target = Clock::time_point();
-  Clock::time_point last_acquire_done = Clock::time_point();
-  Clock::time_point last_refresh_query = Clock::time_point();
-  Ns render_lead = std::chrono::milliseconds(3);
+  bool vrr_like = false;       // refreshInterval != refreshDuration
+
+  // phase model (scanline mode)
+  // phase_base: estimated absolute time the display last started scanning a
+  // frame from the top (a top-of-refresh anchor).
+  Clock::time_point phase_base{};
+  bool phase_seeded = false;
+  Ns present_latency = std::chrono::microseconds(2000); // call -> first-pixel-out
+  Ns render_lead = std::chrono::milliseconds(3);        // acquire-wake -> present-call
+  Ns scanline_offset_ns = Ns::zero();                   // computed from scanline value
+
+  // acquire pacing
+  Clock::time_point next_acquire_target{};
+  Clock::time_point last_acquire_wake{};
+  bool acquire_seeded = false;
+
+  // fps-limit pacing
+  Ns fps_period = Ns::zero();
+  Clock::time_point next_frame_start{};
+  bool fps_seeded = false;
+
+  // present-timing feedback
+  bool timing_enabled = false;        // create flag set on swapchain
+  bool first_pixel_out_supported = false;
+  bool feedback_active = false;       // timing + calibration + stages available
+  uint64_t next_present_id = 1;
+  struct Pending {
+    Clock::time_point present_call;
+    Clock::time_point target; // desired first-pixel-out time
+  };
+  std::unordered_map<uint64_t, Pending> pending;
+
+  // time-domain mapping (present-timing timestamps -> CLOCK_MONOTONIC)
+  VkTimeDomainKHR timing_domain = VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
+  uint64_t timing_domain_id = 0;
+  bool domain_known = false;
+  bool domain_is_monotonic = true;
+  Ns domain_to_monotonic = Ns::zero(); // monotonic = domain_time + offset
+  Clock::time_point last_domain_cal{};
+
+  // jitter tracking for the disable guard
+  Ns last_phase_err = Ns::zero();
+  bool jitter_high = false;
+  uint64_t feedback_count = 0;
+
+  bool logged_setup = false;
 };
 
-struct DeviceDispatch {
+struct InstanceLayer {
+  VkInstance instance = VK_NULL_HANDLE;
+  PFN_vkGetInstanceProcAddr GetInstanceProcAddr = nullptr;
+  PFN_vkGetPhysicalDeviceFeatures2 GetPhysicalDeviceFeatures2 = nullptr;
+  PFN_vkGetPhysicalDeviceProperties2 GetPhysicalDeviceProperties2 = nullptr;
+  PFN_vkEnumerateDeviceExtensionProperties EnumerateDeviceExtensionProperties = nullptr;
+  PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR GetPhysicalDeviceSurfaceCapabilities2KHR = nullptr;
+  PFN_vkGetPhysicalDeviceSurfacePresentModesKHR GetPhysicalDeviceSurfacePresentModesKHR = nullptr;
+  PFN_vkDestroySurfaceKHR DestroySurfaceKHR = nullptr;
+  bool has_surface_caps2 = false;
+};
+
+struct DeviceLayer {
   VkDevice device = VK_NULL_HANDLE;
-  VkPhysicalDevice physical_device = VK_NULL_HANDLE;
-  InstanceDispatch* instance = nullptr;
+  VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
+  InstanceLayer *instance = nullptr;
+
   PFN_vkGetDeviceProcAddr GetDeviceProcAddr = nullptr;
-  PFN_vkDestroyDevice DestroyDevice = nullptr;
   PFN_vkGetDeviceQueue GetDeviceQueue = nullptr;
   PFN_vkGetDeviceQueue2 GetDeviceQueue2 = nullptr;
-  PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
-  PFN_vkWaitForPresentKHR WaitForPresentKHR = nullptr;
-  PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
-  PFN_vkAcquireNextImage2KHR AcquireNextImage2KHR = nullptr;
   PFN_vkCreateSwapchainKHR CreateSwapchainKHR = nullptr;
   PFN_vkDestroySwapchainKHR DestroySwapchainKHR = nullptr;
-  PFN_vkSetSwapchainPresentTimingQueueSizeEXT SetSwapchainPresentTimingQueueSizeEXT = nullptr;
-  PFN_vkGetSwapchainTimingPropertiesEXT GetSwapchainTimingPropertiesEXT = nullptr;
-  PFN_vkGetPastPresentationTimingEXT GetPastPresentationTimingEXT = nullptr;
+  PFN_vkAcquireNextImageKHR AcquireNextImageKHR = nullptr;
+  PFN_vkAcquireNextImage2KHR AcquireNextImage2KHR = nullptr;
+  PFN_vkQueuePresentKHR QueuePresentKHR = nullptr;
+  PFN_vkDeviceWaitIdle DeviceWaitIdle = nullptr;
 
+  // present_id / present_wait
   bool present_id_enabled = false;
   bool present_wait_enabled = false;
-  bool present_timing_enabled = false;
+  PFN_vkWaitForPresentKHR WaitForPresentKHR = nullptr;
 
-  std::mutex present_mutex;
-  std::unordered_map<VkSwapchainKHR, uint64_t> present_ids;
-  std::unordered_map<VkSwapchainKHR, VkPresentModeKHR> present_modes;
+  // present_timing
+  bool present_timing_enabled = false;
+  bool present_timing_caps_queried = false;
+  bool caps_present_timing = false;
+  bool caps_first_pixel_out = false;
+  PFN_vkSetSwapchainPresentTimingQueueSizeEXT SetSwapchainPresentTimingQueueSizeEXT = nullptr;
+  PFN_vkGetSwapchainTimingPropertiesEXT GetSwapchainTimingPropertiesEXT = nullptr;
+  PFN_vkGetSwapchainTimeDomainPropertiesEXT GetSwapchainTimeDomainPropertiesEXT = nullptr;
+  PFN_vkGetPastPresentationTimingEXT GetPastPresentationTimingEXT = nullptr;
+  PFN_vkGetCalibratedTimestampsKHR GetCalibratedTimestampsKHR = nullptr;
+
+  std::mutex mutex;
   std::unordered_map<VkSwapchainKHR, SwapchainState> swapchains;
 };
 
-std::mutex g_mutex;
-std::unordered_map<VkInstance, InstanceDispatch> g_instances;
-std::unordered_map<VkPhysicalDevice, InstanceDispatch*> g_phys_instances;
-std::unordered_map<VkDevice, std::unique_ptr<DeviceDispatch>> g_devices;
-std::unordered_map<VkQueue, DeviceDispatch*> g_queues;
+std::mutex g_instance_mutex;
+std::unordered_map<VkInstance, InstanceLayer *> g_instances;
+std::mutex g_device_mutex;
+std::unordered_map<VkDevice, DeviceLayer *> g_devices;
+std::mutex g_queue_mutex;
+std::unordered_map<VkQueue, DeviceLayer *> g_queues;
+std::unordered_map<VkPhysicalDevice, InstanceLayer *> g_phys_devices;
 
-InstanceDispatch* get_instance_dispatch(VkInstance instance) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_instances.find(instance);
-  return it == g_instances.end() ? nullptr : &it->second;
+InstanceLayer *get_instance(VkInstance i) {
+  std::lock_guard<std::mutex> lk(g_instance_mutex);
+  auto it = g_instances.find(i);
+  return it == g_instances.end() ? nullptr : it->second;
 }
 
-DeviceDispatch* get_device_dispatch(VkDevice device) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_devices.find(device);
-  return it == g_devices.end() ? nullptr : it->second.get();
+DeviceLayer *get_device(VkDevice d) {
+  std::lock_guard<std::mutex> lk(g_device_mutex);
+  auto it = g_devices.find(d);
+  return it == g_devices.end() ? nullptr : it->second;
 }
 
-DeviceDispatch* get_queue_dispatch(VkQueue queue) {
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_queues.find(queue);
+DeviceLayer *get_device_by_queue(VkQueue q) {
+  std::lock_guard<std::mutex> lk(g_queue_mutex);
+  auto it = g_queues.find(q);
   return it == g_queues.end() ? nullptr : it->second;
 }
 
-bool should_wait_for_present_mode(VkPresentModeKHR mode) {
-  // Match DXVK: only wait for actual FIFO vsync modes. Waiting for
-  // MAILBOX/IMMEDIATE can effectively clamp to monitor refresh on some WSI
-  // paths, especially XWayland.
-  return mode == VK_PRESENT_MODE_FIFO_KHR
-      || mode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+// =============================================================================
+// Section 5 — present-timing helpers
+// =============================================================================
+
+// Detect drivers where VK_EXT_present_timing's swapchain create flag is
+// broken. On RADV (Mesa AMD), setting VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT
+// segfaults inside the driver's vkQueuePresentKHR, so present-timing feedback
+// cannot be used there. We auto-disable it so present-timing degrades
+// gracefully to manual scanline pacing instead of crashing the process.
+bool driver_crashes_present_timing(DeviceLayer *dev) {
+  if (!dev || !dev->instance || !dev->instance->GetPhysicalDeviceProperties2)
+    return false;
+  VkPhysicalDeviceDriverProperties drv{};
+  drv.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+  VkPhysicalDeviceProperties2 props2{};
+  props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+  props2.pNext = &drv;
+  dev->instance->GetPhysicalDeviceProperties2(dev->physicalDevice, &props2);
+  return drv.driverID == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+         strcasestr(drv.driverName, "radv") != nullptr;
 }
 
-VkPresentModeKHR get_present_mode(DeviceDispatch* dev,
-                                  VkSwapchainKHR swapchain,
-                                  const VkSwapchainPresentModeInfoEXT* mode_info,
-                                  uint32_t index) {
-  if (mode_info && index < mode_info->swapchainCount && mode_info->pPresentModes)
-    return mode_info->pPresentModes[index];
+// Query VK_EXT_present_timing surface capabilities (stage support). Called from
+// vkCreateSwapchainKHR so we know whether first-pixel-out feedback is possible.
+void query_present_timing_caps(DeviceLayer *dev, VkSurfaceKHR surface) {
+  if (dev->present_timing_caps_queried || !dev->instance ||
+      !dev->instance->GetPhysicalDeviceSurfaceCapabilities2KHR ||
+      !dev->instance->has_surface_caps2 || surface == VK_NULL_HANDLE)
+    return;
+  dev->present_timing_caps_queried = true;
 
-  std::lock_guard<std::mutex> lock(dev->present_mutex);
-  auto it = dev->present_modes.find(swapchain);
-  return it == dev->present_modes.end() ? VK_PRESENT_MODE_MAX_ENUM_KHR : it->second;
-}
+  VkPresentTimingSurfaceCapabilitiesEXT caps{};
+  caps.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT;
 
-bool surface_supports_present_mode(DeviceDispatch* dev, VkSurfaceKHR surface, VkPresentModeKHR wanted) {
-  if (!dev || !dev->instance || !dev->instance->GetPhysicalDeviceSurfacePresentModesKHR)
-    return false;
+  VkSurfaceCapabilities2KHR surf2{};
+  surf2.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
+  surf2.pNext = &caps;
 
-  uint32_t count = 0;
-  VkResult r = dev->instance->GetPhysicalDeviceSurfacePresentModesKHR(dev->physical_device, surface, &count, nullptr);
-  if (r != VK_SUCCESS || !count)
-    return false;
-
-  std::vector<VkPresentModeKHR> modes(count);
-  r = dev->instance->GetPhysicalDeviceSurfacePresentModesKHR(dev->physical_device, surface, &count, modes.data());
-  if (r != VK_SUCCESS && r != VK_INCOMPLETE)
-    return false;
-
-  return std::find(modes.begin(), modes.begin() + count, wanted) != modes.begin() + count;
-}
-
-struct SurfaceTimingCaps {
-  bool present_timing = false;
-  bool first_pixel_out = false;
-};
-
-SurfaceTimingCaps query_surface_timing_caps(DeviceDispatch* dev, VkSurfaceKHR surface) {
-  SurfaceTimingCaps result{};
-
-  if (!dev || !dev->instance || !dev->instance->GetPhysicalDeviceSurfaceCapabilities2KHR)
-    return result;
-
-  VkPresentTimingSurfaceCapabilitiesEXT timing_caps{};
-  timing_caps.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT;
-
-  VkSurfaceCapabilities2KHR caps{};
-  caps.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR;
-  caps.pNext = &timing_caps;
-
-  VkPhysicalDeviceSurfaceInfo2KHR surface_info{};
-  surface_info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
-  surface_info.surface = surface;
+  VkPhysicalDeviceSurfaceInfo2KHR sinfo{};
+  sinfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR;
+  sinfo.surface = surface;
 
   VkResult r = dev->instance->GetPhysicalDeviceSurfaceCapabilities2KHR(
-      dev->physical_device, &surface_info, &caps);
-  if (r != VK_SUCCESS)
-    return result;
-
-  result.present_timing = timing_caps.presentTimingSupported;
-  result.first_pixel_out = !!(timing_caps.presentStageQueries & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
-  return result;
+      dev->physicalDevice, &sinfo, &surf2);
+  if (r != VK_SUCCESS) {
+    log("present_timing: surface caps query failed %d", r);
+    return;
+  }
+  dev->caps_present_timing = !!caps.presentTimingSupported;
+  dev->caps_first_pixel_out =
+      !!(caps.presentStageQueries & VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT);
+  log("present_timing caps: supported=%d first_pixel_out=%d",
+      dev->caps_present_timing, dev->caps_first_pixel_out);
 }
 
-uint64_t query_swapchain_refresh_ns(DeviceDispatch* dev, VkSwapchainKHR swapchain, bool* measured = nullptr) {
-  if (measured)
-    *measured = false;
-
-  if (!dev || !dev->present_timing_enabled || !dev->GetSwapchainTimingPropertiesEXT)
-    return g_scanline_fallback_refresh_ns;
-
-  VkSwapchainTimingPropertiesEXT timing{};
-  timing.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT;
+// Read refreshDuration (and detect VRR via refreshInterval) from the swapchain.
+bool query_refresh(DeviceLayer *dev, VkSwapchainKHR sw, SwapchainState &st) {
+  if (!dev->present_timing_enabled || !dev->GetSwapchainTimingPropertiesEXT)
+    return false;
+  VkSwapchainTimingPropertiesEXT t{};
+  t.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT;
   uint64_t counter = 0;
-
-  VkResult r = dev->GetSwapchainTimingPropertiesEXT(dev->device, swapchain, &timing, &counter);
-  if (r != VK_SUCCESS || !timing.refreshDuration)
-    return g_scanline_fallback_refresh_ns;
-
-  if (timing.refreshInterval == UINT64_MAX)
-    log("scanline: VRR-like refresh interval reported; fixed scanline sync may be unstable");
-
-  if (measured)
-    *measured = true;
-  return timing.refreshDuration;
+  VkResult r = dev->GetSwapchainTimingPropertiesEXT(dev->device, sw, &t, &counter);
+  if (r != VK_SUCCESS || t.refreshDuration == 0)
+    return false;
+  st.refresh_ns = t.refreshDuration;
+  st.refresh_measured = true;
+  // refreshInterval == UINT64_MAX (or != refreshDuration) signals VRR.
+  st.vrr_like = (t.refreshInterval == 0 || t.refreshInterval == UINT64_MAX ||
+                 t.refreshInterval != t.refreshDuration);
+  return true;
 }
 
-Ns scanline_default_render_lead(uint64_t refresh_ns) {
-  Ns refresh(static_cast<int64_t>(refresh_ns ? refresh_ns : g_scanline_fallback_refresh_ns));
-  return std::clamp(std::chrono::duration_cast<Ns>(std::chrono::milliseconds(3)),
-      std::chrono::duration_cast<Ns>(std::chrono::microseconds(250)), refresh / 2);
+// Enumerate the swapchain's supported time domains and pick one. The opaque
+// id we store MUST come from here: passing a stale/zero id in
+// VkPresentTimingInfoEXT.timeDomainId makes the driver dereference an invalid
+// entry (RADV crashes inside vkQueuePresentKHR).
+//
+// Preference order: CLOCK_MONOTONIC > CLOCK_MONOTONIC_RAW > the present-stage
+// local domain > whatever the driver offers first.
+bool query_time_domains(DeviceLayer *dev, VkSwapchainKHR sw, SwapchainState &st) {
+  if (!dev->present_timing_enabled || !dev->GetSwapchainTimeDomainPropertiesEXT)
+    return false;
+
+  VkSwapchainTimeDomainPropertiesEXT props{};
+  props.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_TIME_DOMAIN_PROPERTIES_EXT;
+  props.timeDomainCount = 0;
+  VkResult r = dev->GetSwapchainTimeDomainPropertiesEXT(
+      dev->device, sw, &props, nullptr);
+  if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+    return false;
+  if (props.timeDomainCount == 0)
+    return false;
+
+  uint32_t count = props.timeDomainCount;
+  std::vector<VkTimeDomainKHR> domains(count);
+  std::vector<uint64_t> ids(count);
+  props.timeDomainCount = count;
+  props.pTimeDomains = domains.data();
+  props.pTimeDomainIds = ids.data();
+  r = dev->GetSwapchainTimeDomainPropertiesEXT(dev->device, sw, &props, nullptr);
+  if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+    return false;
+  count = std::min<uint32_t>(count, props.timeDomainCount);
+
+  static const VkTimeDomainKHR pref[] = {
+      VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT,
+      VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT,
+      VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT,
+  };
+  uint32_t chosen = UINT32_MAX;
+  for (VkTimeDomainKHR want : pref) {
+    for (uint32_t i = 0; i < count; i++) {
+      if (domains[i] == want) {
+        chosen = i;
+        break;
+      }
+    }
+    if (chosen != UINT32_MAX)
+      break;
+  }
+  if (chosen == UINT32_MAX)
+    chosen = 0; // fall back to the first offered domain
+
+  st.timing_domain = domains[chosen];
+  st.timing_domain_id = ids[chosen];
+  st.domain_is_monotonic =
+      (st.timing_domain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT ||
+       st.timing_domain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR ||
+       st.timing_domain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT ||
+       st.timing_domain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_KHR);
+  st.domain_known = true;
+  log("present_timing: time domain %u id=%llu monotonic=%d (of %u)",
+      static_cast<unsigned>(st.timing_domain),
+      static_cast<unsigned long long>(st.timing_domain_id),
+      st.domain_is_monotonic ? 1 : 0, count);
+  return true;
 }
 
-Ns scanline_max_render_lead(uint64_t refresh_ns) {
-  Ns refresh(static_cast<int64_t>(refresh_ns ? refresh_ns : g_scanline_fallback_refresh_ns));
-  Ns max_lead = refresh - std::chrono::microseconds(1000);
-  return std::max(max_lead, std::chrono::duration_cast<Ns>(std::chrono::microseconds(250)));
-}
+// Calibrate the present-timing time domain to CLOCK_MONOTONIC.
+//
+// past-presentation stage timestamps are expressed in some VkTimeDomainKHR. On
+// Linux it is usually CLOCK_MONOTONIC already; otherwise we measure the offset
+// with vkGetCalibratedTimestampsKHR (CLOCK_MONOTONIC vs the timing domain).
+bool calibrate_time_domain(DeviceLayer *dev, SwapchainState &st) {
+  if (!dev || !dev->GetCalibratedTimestampsKHR)
+    return false;
 
-Ns positive_mod(Ns value, Ns period) {
-  if (period <= Ns::zero())
-    return Ns::zero();
-
-  int64_t rem = value.count() % period.count();
-  if (rem < 0)
-    rem += period.count();
-  return Ns(rem);
-}
-
-Ns scanline_offset_for_state(const SwapchainState& state) {
-  uint32_t height = std::max(1u, state.extent.height);
-  Ns refresh(static_cast<int64_t>(state.refresh_ns ? state.refresh_ns : g_scanline_fallback_refresh_ns));
-  long double vtotal = std::max<long double>(1.0L,
-      static_cast<long double>(height) * static_cast<long double>(g_scanline_vtotal_scale));
-  auto scanline_ns = Ns(static_cast<int64_t>(std::llround(
-      static_cast<long double>(refresh.count()) * static_cast<long double>(g_scanline.line) / vtotal)));
-
-  // Normalize to one refresh. Negative scanlines intentionally wrap to the end
-  // of the previous refresh, which is how users hide the tearline near vblank.
-  return positive_mod(scanline_ns + g_scanline_offset, refresh);
-}
-
-Clock::time_point scanline_compute_target_locked(SwapchainState& state, Clock::time_point now) {
-  uint32_t height = std::max(1u, state.extent.height);
-  Ns refresh(static_cast<int64_t>(state.refresh_ns ? state.refresh_ns : g_scanline_fallback_refresh_ns));
-  Ns offset = scanline_offset_for_state(state);
-
-  if (!state.scanline_logged) {
-    log("scanline sync active: line=%lld height=%u vtotal_scale=%.3f offset=%lld us refresh=%llu ns measured=%d present_mode=%d timing=%d first_pixel_out=%d",
-        static_cast<long long>(g_scanline.line), height, g_scanline_vtotal_scale,
-        static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(offset).count()),
-        static_cast<unsigned long long>(state.refresh_ns), state.refresh_measured,
-        state.present_mode, state.present_timing_requested, state.first_pixel_out_supported);
-    state.scanline_logged = true;
+  VkTimeDomainKHR doms[2] = {VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR, st.timing_domain};
+  if (st.domain_is_monotonic) {
+    st.domain_to_monotonic = Ns::zero();
+    return true;
   }
 
-  if (state.present_mode != VK_PRESENT_MODE_IMMEDIATE_KHR && !state.non_immediate_logged) {
-    log("scanline: swapchain is not IMMEDIATE present mode (%d); visible tearline control is unlikely",
-        state.present_mode);
-    state.non_immediate_logged = true;
+  VkCalibratedTimestampInfoKHR infos[2]{};
+  infos[0].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+  infos[0].timeDomain = doms[0];
+  infos[1].sType = VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_KHR;
+  infos[1].timeDomain = doms[1];
+
+  uint64_t ts[2] = {};
+  uint64_t devi = 0;
+  VkResult r =
+      dev->GetCalibratedTimestampsKHR(dev->device, 2, infos, ts, &devi);
+  if (r != VK_SUCCESS) {
+    log("present_timing: calibrated timestamps failed %d", r);
+    return false;
   }
-
-  if (state.phase_base == Clock::time_point())
-    state.phase_base = now;
-
-  Clock::time_point target = state.phase_base + offset;
-  if (target <= now) {
-    auto late = std::chrono::duration_cast<Ns>(now - target);
-    int64_t periods = late.count() / refresh.count() + 1;
-    Ns advance(refresh.count() * periods);
-    state.phase_base += advance;
-    target += advance;
-  }
-
-  state.next_present_target = target;
-  return target;
+  // monotonic = domain_time + (ts[0] - ts[1])
+  st.domain_to_monotonic = Ns(static_cast<int64_t>(ts[0]) - static_cast<int64_t>(ts[1]));
+  return true;
 }
 
-void scanline_acquire_delay(DeviceDispatch* dev, VkSwapchainKHR swapchain) {
-  if (!g_scanline.active || !swapchain)
+// Poll past presentation timing, match presentIds, and run the PLL that keeps
+// phase_base (display scanout phase) and present_latency aligned to reality.
+void poll_feedback(DeviceLayer *dev, VkSwapchainKHR sw, SwapchainState &st) {
+  if (!dev->present_timing_enabled || !dev->GetPastPresentationTimingEXT ||
+      !st.feedback_active || st.pending.empty())
     return;
 
   auto now = Clock::now();
-  Clock::time_point wake = now;
-
-  {
-    std::lock_guard<std::mutex> lock(dev->present_mutex);
-    auto it = dev->swapchains.find(swapchain);
-    if (it == dev->swapchains.end())
-      return;
-
-    SwapchainState& state = it->second;
-    // Lazily re-query refresh duration: some drivers only populate it after
-    // the first few presents, so the initial value may still be the fallback.
-    if (state.present_timing_requested && !state.refresh_measured &&
-        (state.last_refresh_query == Clock::time_point() || now - state.last_refresh_query > std::chrono::seconds(1))) {
-      state.last_refresh_query = now;
-      bool measured = false;
-      uint64_t refresh_ns = query_swapchain_refresh_ns(dev, swapchain, &measured);
-      if (measured) {
-        state.refresh_ns = refresh_ns;
-        state.refresh_measured = true;
-        state.render_lead = std::min(state.render_lead, scanline_max_render_lead(state.refresh_ns));
-        state.scanline_logged = false;
-        log("scanline: measured refresh %llu ns", static_cast<unsigned long long>(refresh_ns));
-      }
-    }
-    Clock::time_point target = scanline_compute_target_locked(state, now);
-    // Start rendering based on measured acquire->present time. This keeps the
-    // input-lag win of frame-start pacing while adapting enough lead time to
-    // avoid missing the target scanline and causing jumps.
-    wake = target - state.render_lead - g_scanline_acquire_margin;
-  }
-
-  if (wake > now)
-    DxvkStyleSleep::sleep_until(now, wake);
-}
-
-void scanline_mark_acquire_done(DeviceDispatch* dev, VkSwapchainKHR swapchain, VkResult result) {
-  if (!g_scanline.active || !swapchain || (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR))
-    return;
-
-  std::lock_guard<std::mutex> lock(dev->present_mutex);
-  auto it = dev->swapchains.find(swapchain);
-  if (it != dev->swapchains.end())
-    it->second.last_acquire_done = Clock::now();
-}
-
-// Present-timing feedback polling. Currently unused while the feedback path is
-// disabled to avoid launch freezes; retained for the future PLL implementation.
-[[maybe_unused]]
-void scanline_poll_feedback(DeviceDispatch* dev, VkSwapchainKHR swapchain) {
-  if (!g_scanline.active || !dev || !dev->present_timing_enabled || !dev->GetPastPresentationTimingEXT || !swapchain)
-    return;
-
-  // Throttle to ~2 Hz to avoid log spam and overhead.
-  static std::mutex poll_mutex;
-  static std::unordered_map<VkSwapchainKHR, Clock::time_point> last_poll;
-  {
-    std::lock_guard<std::mutex> lock(poll_mutex);
-    auto& t = last_poll[swapchain];
-    auto now = Clock::now();
-    if (now - t < std::chrono::milliseconds(500))
-      return;
-    t = now;
+  // Re-calibrate the time domain periodically.
+  if (!st.domain_is_monotonic &&
+      (st.last_domain_cal == Clock::time_point() ||
+       now - st.last_domain_cal > std::chrono::seconds(1))) {
+    if (calibrate_time_domain(dev, st))
+      st.last_domain_cal = now;
   }
 
   VkPastPresentationTimingInfoEXT info{};
   info.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT;
-  info.swapchain = swapchain;
+  info.flags = VK_PAST_PRESENTATION_TIMING_ALLOW_PARTIAL_RESULTS_BIT_EXT |
+               VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_ORDER_RESULTS_BIT_EXT;
+  info.swapchain = sw;
 
   VkPastPresentationTimingPropertiesEXT props{};
   props.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT;
 
-  uint32_t count = 0;
-  (void)count;
   VkResult r = dev->GetPastPresentationTimingEXT(dev->device, &info, &props);
   if (r != VK_SUCCESS && r != VK_INCOMPLETE && r != VK_NOT_READY)
     return;
   if (!props.presentationTimingCount)
     return;
 
+  std::vector<VkPresentStageTimeEXT> stages(props.presentationTimingCount);
   std::vector<VkPastPresentationTimingEXT> timings(props.presentationTimingCount);
-  for (auto& t : timings) {
-    t.sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
-    t.presentStageCount = 0;
+  for (uint32_t i = 0; i < props.presentationTimingCount; i++) {
+    timings[i].sType = VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT;
+    timings[i].presentStageCount = 1;
+    timings[i].pPresentStages = &stages[i];
   }
   props.pPresentationTimings = timings.data();
   r = dev->GetPastPresentationTimingEXT(dev->device, &info, &props);
-  if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+  if (r != VK_SUCCESS && r != VK_INCOMPLETE && r != VK_NOT_READY)
     return;
 
-  // Log the newest entry's stages + time domain, to confirm feedback is real
-  // and discover which time domain the stage timestamps use.
-  const auto& last = timings[props.presentationTimingCount - 1];
-  const char* td = "?";
-  switch (last.timeDomain) {
-    case VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT: td = "MONOTONIC"; break;
-    case VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT: td = "MONOTONIC_RAW"; break;
-    case VK_TIME_DOMAIN_DEVICE_EXT: td = "DEVICE"; break;
-    case VK_TIME_DOMAIN_PRESENT_STAGE_LOCAL_EXT: td = "PRESENT_STAGE_LOCAL"; break;
-    case VK_TIME_DOMAIN_SWAPCHAIN_LOCAL_EXT: td = "SWAPCHAIN_LOCAL"; break;
-    default: break;
-  }
-  log("scanline feedback: id=%llu td=%s stages=%u complete=%d",
-      static_cast<unsigned long long>(last.presentId), td,
-      last.presentStageCount, last.reportComplete);
-  for (uint32_t i = 0; i < last.presentStageCount; i++)
-    log("  stage=0x%x time=%llu", last.pPresentStages[i].stage,
-        static_cast<unsigned long long>(last.pPresentStages[i].time));
-}
+  int64_t refresh = st.refresh_ns ? static_cast<int64_t>(st.refresh_ns)
+                                  : static_cast<int64_t>(g_cfg.fallback_refresh.count());
 
-void scanline_present_delay(DeviceDispatch* dev,
-                            const VkPresentInfoKHR* pPresentInfo,
-                            const VkSwapchainPresentModeInfoEXT* mode_info) {
-  if (!g_scanline.active || !pPresentInfo || !pPresentInfo->swapchainCount || !pPresentInfo->pSwapchains)
-    return;
+  for (uint32_t i = 0; i < props.presentationTimingCount; i++) {
+    const auto &tm = timings[i];
+    if (!tm.reportComplete || !tm.presentStageCount)
+      continue;
 
-  VkSwapchainKHR swapchain = pPresentInfo->pSwapchains[0];
-  auto now = Clock::now();
-  Clock::time_point target = now;
+    const VkPresentStageTimeEXT *chosen = nullptr;
+    for (uint32_t s = 0; s < tm.presentStageCount; s++) {
+      if (tm.pPresentStages[s].stage &
+          VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT) {
+        chosen = &tm.pPresentStages[s];
+        break;
+      }
+    }
+    if (!chosen)
+      continue;
 
-  {
-    std::lock_guard<std::mutex> lock(dev->present_mutex);
-    auto it = dev->swapchains.find(swapchain);
-    if (it == dev->swapchains.end())
-      return;
-
-    SwapchainState& state = it->second;
-    if (mode_info && mode_info->swapchainCount && mode_info->pPresentModes)
-      state.present_mode = mode_info->pPresentModes[0];
-
-    if (state.last_acquire_done != Clock::time_point() && now > state.last_acquire_done) {
-      Ns measured = std::chrono::duration_cast<Ns>(now - state.last_acquire_done);
-      measured = std::clamp(measured,
-          std::chrono::duration_cast<Ns>(std::chrono::microseconds(250)),
-          scanline_max_render_lead(state.refresh_ns));
-      state.render_lead = Ns((state.render_lead.count() * 9 + measured.count()) / 10);
+    // Learn the time domain from the first report, and calibrate to
+    // CLOCK_MONOTONIC if it isn't already.
+    if (!st.domain_known) {
+      st.timing_domain = tm.timeDomain;
+      st.timing_domain_id = tm.timeDomainId;
+      st.domain_is_monotonic =
+          (tm.timeDomain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT ||
+           tm.timeDomain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_KHR);
+      st.domain_known = true;
+      log("present_timing: time domain = %u (monotonic=%d)",
+          static_cast<unsigned>(st.timing_domain),
+          st.domain_is_monotonic ? 1 : 0);
+    } else if (tm.timeDomain != st.timing_domain ||
+               tm.timeDomainId != st.timing_domain_id) {
+      // Domain changed underneath us; drop this entry.
+      st.pending.erase(st.pending.find(tm.presentId));
+      continue;
     }
 
-    target = state.next_present_target;
-    if (target == Clock::time_point() || target <= now)
-      target = scanline_compute_target_locked(state, now);
+    auto pit = st.pending.find(tm.presentId);
+    if (pit == st.pending.end())
+      continue;
+
+    Clock::time_point actual =
+        Clock::time_point(Ns(static_cast<int64_t>(chosen->time))) +
+        st.domain_to_monotonic;
+
+    // Phase error: how far the actual first-pixel-out was from our target.
+    // Wrap to [-T/2, T/2] so the PLL corrects the short way.
+    auto raw = std::chrono::duration_cast<Ns>(actual - pit->second.target);
+    int64_t e = raw.count();
+    e = ((e + refresh / 2) % refresh + refresh) % refresh - refresh / 2;
+    Ns err(e);
+
+    // present_latency = present-call -> first-pixel-out (EWMA).
+    Ns measured_latency =
+        std::chrono::duration_cast<Ns>(actual - pit->second.present_call);
+    st.present_latency =
+        Ns(static_cast<int64_t>(st.present_latency.count() *
+                                    (1.0 - g_cfg.latency_alpha) +
+                                measured_latency.count() * g_cfg.latency_alpha));
+
+    // PLL on phase_base.
+    int64_t step = static_cast<int64_t>(std::llround(err.count() * g_cfg.pll_strength));
+    step = std::clamp(step, -g_cfg.pll_max_step.count(), g_cfg.pll_max_step.count());
+    st.phase_base += Ns(step);
+
+    // jitter tracking for the disable guard
+    Ns derr = err - st.last_phase_err;
+    st.last_phase_err = err;
+    if (st.feedback_count > 4 && std::abs(derr.count()) > g_cfg.disable_jitter.count())
+      st.jitter_high = true;
+    st.feedback_count++;
+
+    st.pending.erase(pit);
   }
 
-  // Most waiting should happen at acquire/frame start. This final wait is only
-  // a correction; cap it to avoid a whole-refresh stall if the frame missed the
-  // target badly.
-  if (target > now && target - now <= g_scanline_max_present_wait)
-    DxvkStyleSleep::sleep_until(now, target);
+  // Bound the pending map so a runaway driver can't leak memory.
+  if (st.pending.size() > 64)
+    st.pending.clear();
+}
+
+// =============================================================================
+// Section 6 — pacing algorithms
+// =============================================================================
+
+// Wrap a signed ns offset into [0, refresh).
+int64_t wrap_period(int64_t v, int64_t refresh) {
+  if (refresh <= 0)
+    return 0;
+  v %= refresh;
+  if (v < 0)
+    v += refresh;
+  return v;
+}
+
+// Compute scanline_offset_ns from the requested scanline value and geometry.
+void recompute_scanline_offset(SwapchainState &st) {
+  int64_t refresh = st.refresh_ns ? static_cast<int64_t>(st.refresh_ns)
+                                  : static_cast<int64_t>(g_cfg.fallback_refresh.count());
+  double vtotal = std::max(1.0, static_cast<double>(st.height) * g_cfg.vtotal_scale);
+  double frac = static_cast<double>(st.scanline) / vtotal; // may be negative
+  int64_t off = static_cast<int64_t>(std::llround(frac * static_cast<double>(refresh)));
+  st.scanline_offset_ns = Ns(wrap_period(off, refresh));
+}
+
+// The desired first-pixel-out time for THIS frame. Each call advances the
+// phase anchor by exactly one refresh (one frame per refresh, like RTSS), and
+// skips forward only when a slot was missed because rendering fell behind.
+// This is what caps the frame rate to the refresh rate with even spacing.
+Clock::time_point scanline_target(SwapchainState &st, Clock::time_point now) {
+  int64_t refresh = st.refresh_ns ? static_cast<int64_t>(st.refresh_ns)
+                                  : static_cast<int64_t>(g_cfg.fallback_refresh.count());
+  if (!st.phase_seeded) {
+    // Seed phase_base roughly now; the PLL refines it from feedback.
+    st.phase_base = now;
+    st.phase_seeded = true;
+  }
+  Clock::time_point target = st.phase_base + st.scanline_offset_ns;
+  // Skip only slots whose target time is actually already gone. The old logic
+  // skipped as soon as the *wake* time was missed, which made scanline mode
+  // drop whole refreshes from tiny scheduler/render-lead jitter. It is smoother
+  // to keep the current slot if the target itself is still ahead; the final
+  // present-side wait can still hit the desired phase.
+  while (target <= now) {
+    st.phase_base += Ns(refresh);
+    target += Ns(refresh);
+  }
+  // Consume this slot: advance the anchor by one refresh so the next frame
+  // targets the next refresh. Without this, multiple frames would pile onto
+  // the same slot and burst past the refresh rate.
+  st.phase_base += Ns(refresh);
+  return target;
+}
+
+// Forward declaration: hotkey handling lives in a later section but the
+// pacing loop polls it here.
+void apply_hotkeys();
+
+// Mode 2 — pace the frame start at acquire for low input lag.
+void scanline_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
+  if (g_cfg.mode != Mode::ScanlineSync)
+    return;
+  std::lock_guard<std::mutex> lk(dev->mutex);
+  auto it = dev->swapchains.find(sw);
+  if (it == dev->swapchains.end())
+    return;
+  SwapchainState &st = it->second;
+
+  // Lazily re-query refresh; some drivers only populate it after warmup.
+  if (dev->present_timing_enabled && !st.refresh_measured)
+    query_refresh(dev, sw, st);
+  if (!st.refresh_measured) {
+    st.refresh_ns = static_cast<uint64_t>(g_cfg.fallback_refresh.count());
+    recompute_scanline_offset(st);
+  } else {
+    recompute_scanline_offset(st);
+  }
+
+  if (g_cfg.disable_when_vrr && st.vrr_like) {
+    static bool warned = false;
+    if (!warned) {
+      log("scanline: VRR-like refresh detected; phase may drift (feedback off)");
+      warned = true;
+    }
+  }
+
+  // Hotkey offset adjustment.
+  apply_hotkeys();
+
+  auto now = Clock::now();
+  Clock::time_point target = scanline_target(st, now);
+  Ns live_offset = Ns(g_live_offset_ns.load(std::memory_order_relaxed));
+  // Wake early enough to finish rendering before the desired present call.
+  Clock::time_point wake =
+      target - st.present_latency - st.render_lead - g_cfg.acquire_margin +
+      live_offset;
+
+  st.next_acquire_target = target;
+  st.last_acquire_wake = std::max(wake, now);
+
+  if (wake > now)
+    Sleeper::wait_until(wake, g_cfg.busy_window);
+}
+
+void scanline_record_acquire(DeviceLayer *dev, VkSwapchainKHR sw, VkResult res) {
+  if (g_cfg.mode != Mode::ScanlineSync)
+    return;
+  if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
+    return;
+  std::lock_guard<std::mutex> lk(dev->mutex);
+  auto it = dev->swapchains.find(sw);
+  if (it != dev->swapchains.end())
+    it->second.last_acquire_wake = Clock::now();
+}
+
+// Mode 2 — small final correction before calling down-chain QueuePresent.
+Clock::time_point scanline_present_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
+  if (g_cfg.mode != Mode::ScanlineSync)
+    return Clock::time_point();
+  std::lock_guard<std::mutex> lk(dev->mutex);
+  auto it = dev->swapchains.find(sw);
+  if (it == dev->swapchains.end())
+    return Clock::time_point();
+  SwapchainState &st = it->second;
+
+  poll_feedback(dev, sw, st);
+
+  auto now = Clock::now();
+  Clock::time_point target = st.next_acquire_target; // set during acquire pace
+  // If acquire pacing was skipped (e.g. first frame), compute it now.
+  if (target == Clock::time_point())
+    target = scanline_target(st, now);
+
+  Ns live_offset = Ns(g_live_offset_ns.load(std::memory_order_relaxed));
+  Clock::time_point desired_present_call = target - st.present_latency + live_offset;
+
+  if (desired_present_call > now) {
+    Ns remaining = std::chrono::duration_cast<Ns>(desired_present_call - now);
+    if (remaining <= g_cfg.max_present_wait)
+      Sleeper::wait_until(desired_present_call, g_cfg.busy_window);
+  }
+
+  // Update render_lead EWMA from the real acquire-wake -> present-call span.
+  if (st.last_acquire_wake != Clock::time_point()) {
+    Ns measured =
+        std::chrono::duration_cast<Ns>(Clock::now() - st.last_acquire_wake);
+    if (measured.count() > 0)
+      st.render_lead =
+          Ns(static_cast<int64_t>(st.render_lead.count() *
+                                      (1.0 - g_cfg.render_alpha) +
+                                  measured.count() * g_cfg.render_alpha));
+    // Clamp render_lead to a sane window.
+    int64_t refresh = st.refresh_ns ? static_cast<int64_t>(st.refresh_ns)
+                                    : static_cast<int64_t>(g_cfg.fallback_refresh.count());
+    // Keep render_lead within the range the final present wait can correct.
+    // If render_lead grows too large after one slow frame, the next fast frame
+    // wakes very early, final correction refuses to wait (remaining > max), and
+    // the present happens early -> visible frametime jitter. Default max:
+    // max_present_wait(4ms) - acquire_margin(0.75ms) ~= 3.25ms.
+    Ns max_correctable = g_cfg.max_present_wait > g_cfg.acquire_margin
+                             ? g_cfg.max_present_wait - g_cfg.acquire_margin
+                             : g_cfg.max_present_wait;
+    max_correctable = std::max(max_correctable, Ns(std::chrono::microseconds(500)));
+    st.render_lead = std::clamp<Ns>(
+        st.render_lead, Ns(std::chrono::microseconds(200)),
+        std::min(Ns(refresh / 2), max_correctable));
+  }
+
+  if (!st.logged_setup) {
+    st.logged_setup = true;
+    log("scanline: mode=%s immediate=%d refresh=%lluns offset=%+lldus "
+        "feedback=%d latency=%lldus lead=%lldus",
+        "scanline-sync", st.immediate_active ? 1 : 0,
+        static_cast<unsigned long long>(st.refresh_ns),
+        static_cast<long long>(st.scanline_offset_ns.count() / 1000),
+        st.feedback_active ? 1 : 0,
+        static_cast<long long>(st.present_latency.count() / 1000),
+        static_cast<long long>(st.render_lead.count() / 1000));
+  }
+
+  return target;
+}
+
+// Mode 1 — pace frame start at acquire.
+void fps_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
+  if (g_cfg.mode != Mode::FpsLimit)
+    return;
+  double fps = g_live_fps.load(std::memory_order_relaxed);
+  if (fps <= 0.0)
+    return;
+  std::lock_guard<std::mutex> lk(dev->mutex);
+  auto it = dev->swapchains.find(sw);
+  if (it == dev->swapchains.end())
+    return;
+  SwapchainState &st = it->second;
+
+  apply_hotkeys();
+
+  if (st.fps_period.count() == 0)
+    st.fps_period = Ns(static_cast<int64_t>(1e9 / fps));
+
+  auto now = Clock::now();
+  if (!st.fps_seeded) {
+    st.next_frame_start = now;
+    st.fps_seeded = true;
+  }
+  // Re-derive period from the live cap each frame.
+  st.fps_period = Ns(static_cast<int64_t>(1e9 / fps));
+
+  if (st.next_frame_start > now)
+    Sleeper::wait_until(st.next_frame_start, g_cfg.busy_window);
+
+  // Advance by whole periods; if we fell behind, skip ahead to avoid bursts.
+  now = Clock::now();
+  while (st.next_frame_start <= now)
+    st.next_frame_start += st.fps_period;
+}
+
+// =============================================================================
+// Section 7 — hotkeys
+//
+// FPS mode: Shift+/- steps 0.01, Ctrl+/- steps 0.10.
+// Scanline mode: Shift+/- steps the phase offset by 1ms, Ctrl+/- by 0.1ms.
+// =============================================================================
+
+enum class HotkeyCombo {
+  NoCombo,
+  IncreaseSlow,
+  DecreaseSlow,
+  IncreaseFast,
+  DecreaseFast,
+};
+
+std::mutex g_hotkey_mutex;
+Clock::time_point g_last_hotkey_check;
+HotkeyCombo g_held_hotkey = HotkeyCombo::NoCombo;
+
+HotkeyCombo poll_hotkey_combo() {
+  // Ctrl combos first, so Ctrl+Shift+Plus still means the fast action.
+  if (vfc::key_input::increase_fast_pressed())
+    return HotkeyCombo::IncreaseFast;
+  if (vfc::key_input::decrease_fast_pressed())
+    return HotkeyCombo::DecreaseFast;
+  if (vfc::key_input::increase_pressed())
+    return HotkeyCombo::IncreaseSlow;
+  if (vfc::key_input::decrease_pressed())
+    return HotkeyCombo::DecreaseSlow;
+  return HotkeyCombo::NoCombo;
+}
+
+void apply_hotkey_action(HotkeyCombo combo) {
+  if (combo == HotkeyCombo::NoCombo)
+    return;
+
+  if (g_cfg.mode == Mode::FpsLimit) {
+    double f = g_live_fps.load(std::memory_order_relaxed);
+    switch (combo) {
+    case HotkeyCombo::IncreaseSlow:
+      f += 0.01;
+      break;
+    case HotkeyCombo::DecreaseSlow:
+      f -= 0.01;
+      break;
+    case HotkeyCombo::IncreaseFast:
+      f += 0.10;
+      break;
+    case HotkeyCombo::DecreaseFast:
+      f -= 0.10;
+      break;
+    case HotkeyCombo::NoCombo:
+      break;
+    }
+    f = std::clamp(f, 1.0, 1000.0);
+    g_live_fps.store(f, std::memory_order_relaxed);
+    log("fps cap -> %.2f", f);
+  } else if (g_cfg.mode == Mode::ScanlineSync) {
+    int64_t off = g_live_offset_ns.load(std::memory_order_relaxed);
+    constexpr int64_t coarse = 1'000'000; // 1 ms
+    constexpr int64_t fine = 100'000;     // 0.1 ms
+    switch (combo) {
+    case HotkeyCombo::IncreaseSlow:
+      off += coarse;
+      break;
+    case HotkeyCombo::DecreaseSlow:
+      off -= coarse;
+      break;
+    case HotkeyCombo::IncreaseFast:
+      off += fine;
+      break;
+    case HotkeyCombo::DecreaseFast:
+      off -= fine;
+      break;
+    case HotkeyCombo::NoCombo:
+      break;
+    }
+    off = std::clamp<int64_t>(off, -1'000'000'000LL, 1'000'000'000LL);
+    g_live_offset_ns.store(off, std::memory_order_relaxed);
+    log("scanline offset -> %+lld us", static_cast<long long>(off / 1000));
+  }
+}
+
+void apply_hotkeys() {
+  std::lock_guard<std::mutex> lk(g_hotkey_mutex);
+
+  auto now = Clock::now();
+  // Throttle polling (XQueryKeymap / wayland dispatch) to ~50 Hz.
+  if (now - g_last_hotkey_check < std::chrono::milliseconds(20))
+    return;
+  g_last_hotkey_check = now;
+
+  HotkeyCombo current = poll_hotkey_combo();
+
+  if (current != HotkeyCombo::NoCombo) {
+    // Record the combo while held, but do not repeat. If the user changes from
+    // one combo to another without releasing, track the new combo.
+    g_held_hotkey = current;
+    return;
+  }
+
+  // Fire exactly once when the combo is released.
+  HotkeyCombo released = g_held_hotkey;
+  g_held_hotkey = HotkeyCombo::NoCombo;
+  apply_hotkey_action(released);
+}
+
+// =============================================================================
+// Section 8 — pNext-chain helpers
+// =============================================================================
+
+const void *find_in_chain(const void *pNext, VkStructureType sType) {
+  while (pNext) {
+    auto *s = static_cast<const VkBaseInStructure *>(pNext);
+    if (s->sType == sType)
+      return pNext;
+    pNext = s->pNext;
+  }
+  return nullptr;
+}
+
+bool device_has_extension(InstanceLayer *inst, VkPhysicalDevice pd,
+                          const char *name) {
+  if (!inst || !inst->EnumerateDeviceExtensionProperties)
+    return false;
+  uint32_t count = 0;
+  if (inst->EnumerateDeviceExtensionProperties(pd, nullptr, &count, nullptr) !=
+      VK_SUCCESS)
+    return false;
+  std::vector<VkExtensionProperties> exts(count);
+  if (inst->EnumerateDeviceExtensionProperties(pd, nullptr, &count, exts.data()) !=
+      VK_SUCCESS)
+    return false;
+  for (auto &e : exts)
+    if (std::strcmp(e.extensionName, name) == 0)
+      return true;
+  return false;
 }
 
 } // namespace
 
+// =============================================================================
+// Section 9 — layer entry points (extern "C", global linkage so the loader can
+// resolve vkNegotiateLoaderLayerInterfaceVersion by name via dlsym).
+// =============================================================================
+
 extern "C" {
 
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkNegotiateLoaderLayerInterfaceVersion(
-    VkNegotiateLayerInterface* pVersionStruct) {
-  if (!pVersionStruct)
-    return VK_ERROR_INITIALIZATION_FAILED;
+// ---- Instance ----
 
-  pVersionStruct->loaderLayerInterfaceVersion = std::min<uint32_t>(
-      pVersionStruct->loaderLayerInterfaceVersion, CURRENT_LOADER_LAYER_INTERFACE_VERSION);
-  pVersionStruct->pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
-  pVersionStruct->pfnGetDeviceProcAddr = vkGetDeviceProcAddr;
-  pVersionStruct->pfnGetPhysicalDeviceProcAddr = nullptr;
-  return VK_SUCCESS;
+// Pull the loader's layer link info out of the pNext chain. The loader inserts
+// a VkLayerInstanceCreateInfo / VkLayerDeviceCreateInfo (function ==
+// VK_LAYER_LINK_INFO) whose pLayerInfo points at the next layer's proc-addr.
+static VkLayerInstanceCreateInfo *
+get_instance_link(const void *pNext) {
+  while (pNext) {
+    auto *s = static_cast<const VkBaseInStructure *>(pNext);
+    if (s->sType == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO) {
+      auto *lic = const_cast<VkLayerInstanceCreateInfo *>(
+          static_cast<const VkLayerInstanceCreateInfo *>(pNext));
+      if (lic->function == VK_LAYER_LINK_INFO)
+        return lic;
+    }
+    pNext = s->pNext;
+  }
+  return nullptr;
 }
 
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkCreateInstance(
-    const VkInstanceCreateInfo* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkInstance* pInstance) {
-  auto* chain = get_layer_link_info<VkLayerInstanceCreateInfo*>(
-      pCreateInfo->pNext, VK_LAYER_LINK_INFO, VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO);
-  if (!chain || !chain->u.pLayerInfo)
-    return VK_ERROR_INITIALIZATION_FAILED;
-
-  PFN_vkGetInstanceProcAddr next_gipa = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
-  chain->u.pLayerInfo = chain->u.pLayerInfo->pNext;
-
-  auto next_create = reinterpret_cast<PFN_vkCreateInstance>(next_gipa(nullptr, "vkCreateInstance"));
-  if (!next_create)
-    return VK_ERROR_INITIALIZATION_FAILED;
-
-  VkInstanceCreateInfo create_info = *pCreateInfo;
-  std::vector<const char*> enabled_instance_exts;
-  bool want_surface_caps2 = g_want_present_timing && g_scanline.active
-      && !name_in_list(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
-          pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
-
-  if (want_surface_caps2) {
-    enabled_instance_exts.reserve(pCreateInfo->enabledExtensionCount + 1);
-    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++)
-      enabled_instance_exts.push_back(pCreateInfo->ppEnabledExtensionNames[i]);
-    enabled_instance_exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
-    create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_instance_exts.size());
-    create_info.ppEnabledExtensionNames = enabled_instance_exts.data();
+static VkLayerDeviceCreateInfo *
+get_device_link(const void *pNext) {
+  while (pNext) {
+    auto *s = static_cast<const VkBaseInStructure *>(pNext);
+    if (s->sType == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO) {
+      auto *ldc = const_cast<VkLayerDeviceCreateInfo *>(
+          static_cast<const VkLayerDeviceCreateInfo *>(pNext));
+      if (ldc->function == VK_LAYER_LINK_INFO)
+        return ldc;
+    }
+    pNext = s->pNext;
   }
-
-  VkResult r = next_create(&create_info, pAllocator, pInstance);
-  if (r != VK_SUCCESS && want_surface_caps2) {
-    // The ICD may not support VK_KHR_get_surface_capabilities2; fall back.
-    log("scanline: %s not supported (0x%x); continuing without present-timing surface caps",
-        VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, r);
-    create_info = *pCreateInfo;
-    r = next_create(&create_info, pAllocator, pInstance);
-  }
-  if (r != VK_SUCCESS)
-    return r;
-
-  InstanceDispatch inst{};
-  inst.instance = *pInstance;
-  inst.GetInstanceProcAddr = next_gipa;
-  inst.GetDeviceProcAddr = reinterpret_cast<PFN_vkGetDeviceProcAddr>(next_gipa(*pInstance, "vkGetDeviceProcAddr"));
-  inst.DestroyInstance = reinterpret_cast<PFN_vkDestroyInstance>(next_gipa(*pInstance, "vkDestroyInstance"));
-  inst.CreateDevice = reinterpret_cast<PFN_vkCreateDevice>(next_gipa(*pInstance, "vkCreateDevice"));
-  inst.EnumeratePhysicalDevices = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(next_gipa(*pInstance, "vkEnumeratePhysicalDevices"));
-  inst.GetPhysicalDeviceFeatures2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(next_gipa(*pInstance, "vkGetPhysicalDeviceFeatures2"));
-  inst.EnumerateDeviceExtensionProperties = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(next_gipa(*pInstance, "vkEnumerateDeviceExtensionProperties"));
-  inst.GetPhysicalDeviceSurfacePresentModesKHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(next_gipa(*pInstance, "vkGetPhysicalDeviceSurfacePresentModesKHR"));
-  inst.GetPhysicalDeviceSurfaceCapabilities2KHR = reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(next_gipa(*pInstance, "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
-  inst.CreateWaylandSurfaceKHR = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(next_gipa(*pInstance, "vkCreateWaylandSurfaceKHR"));
-  inst.DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(next_gipa(*pInstance, "vkDestroySurfaceKHR"));
-
-  std::lock_guard<std::mutex> lock(g_mutex);
-  g_instances[*pInstance] = inst;
-  log("created instance");
-  return VK_SUCCESS;
+  return nullptr;
 }
 
-VK_LAYER_EXPORT void VKAPI_CALL vkDestroyInstance(
-    VkInstance instance,
-    const VkAllocationCallbacks* pAllocator) {
-  InstanceDispatch inst{};
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkCreateInstance(const VkInstanceCreateInfo *pCreateInfo,
+                 const VkAllocationCallbacks *pAllocator, VkInstance *pInstance) {
+  auto *layer = new InstanceLayer();
+
+  // Resolve the down-chain gipa from the loader's layer link info.
+  VkLayerInstanceCreateInfo *link = get_instance_link(pCreateInfo->pNext);
+  if (!link || !link->u.pLayerInfo) {
+    delete layer;
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+  VkLayerInstanceLink *layer_link = link->u.pLayerInfo;
+  PFN_vkGetInstanceProcAddr next_gipa =
+      layer_link->pfnNextGetInstanceProcAddr;
+  if (!next_gipa) {
+    delete layer;
+    return VK_ERROR_INITIALIZATION_FAILED;
+  }
+
+  VkInstanceCreateInfo ci = *pCreateInfo;
+
+  // Ensure VK_KHR_get_surface_capabilities2 is enabled so we can query
+  // present-timing surface caps (only when scanline + present_timing wanted).
+  std::vector<const char *> exts;
+  bool need_surface_caps2 =
+      g_cfg.want_present_timing && g_cfg.mode == Mode::ScanlineSync;
+  if (need_surface_caps2) {
+    bool present = false;
+    if (ci.ppEnabledExtensionNames) {
+      for (uint32_t i = 0; i < ci.enabledExtensionCount; i++) {
+        if (std::strcmp(ci.ppEnabledExtensionNames[i],
+                        VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME) == 0)
+          present = true;
+      }
+    }
+    if (!present) {
+      exts.assign(ci.ppEnabledExtensionNames,
+                  ci.ppEnabledExtensionNames + ci.enabledExtensionCount);
+      exts.push_back(VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME);
+      ci.ppEnabledExtensionNames = exts.data();
+      ci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+    }
+  }
+
+  PFN_vkCreateInstance chain_create = reinterpret_cast<PFN_vkCreateInstance>(
+      next_gipa(VK_NULL_HANDLE, "vkCreateInstance"));
+
+  // Advance the link so the next layer in the chain sees its own link info.
+  link->u.pLayerInfo = layer_link->pNext;
+
+  VkResult res = chain_create(&ci, pAllocator, pInstance);
+  if (res != VK_SUCCESS) {
+    delete layer;
+    return res;
+  }
+
+  layer->instance = *pInstance;
+  layer->GetInstanceProcAddr = next_gipa;
+    layer->GetPhysicalDeviceFeatures2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            next_gipa(layer->instance, "vkGetPhysicalDeviceFeatures2"));
+  if (!layer->GetPhysicalDeviceFeatures2)
+    layer->GetPhysicalDeviceFeatures2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
+            next_gipa(layer->instance, "vkGetPhysicalDeviceFeatures2KHR"));
+  layer->GetPhysicalDeviceProperties2 =
+      reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+          next_gipa(layer->instance, "vkGetPhysicalDeviceProperties2"));
+  if (!layer->GetPhysicalDeviceProperties2)
+    layer->GetPhysicalDeviceProperties2 =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+            next_gipa(layer->instance,
+                     "vkGetPhysicalDeviceProperties2KHR"));
+  layer->EnumerateDeviceExtensionProperties =
+      reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(
+          next_gipa(layer->instance, "vkEnumerateDeviceExtensionProperties"));
+  layer->GetPhysicalDeviceSurfaceCapabilities2KHR =
+      reinterpret_cast<PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR>(
+          next_gipa(layer->instance,
+                    "vkGetPhysicalDeviceSurfaceCapabilities2KHR"));
+  layer->GetPhysicalDeviceSurfacePresentModesKHR =
+      reinterpret_cast<PFN_vkGetPhysicalDeviceSurfacePresentModesKHR>(
+          next_gipa(layer->instance,
+                    "vkGetPhysicalDeviceSurfacePresentModesKHR"));
+  layer->DestroySurfaceKHR = reinterpret_cast<PFN_vkDestroySurfaceKHR>(
+      next_gipa(layer->instance, "vkDestroySurfaceKHR"));
+  layer->has_surface_caps2 =
+      need_surface_caps2 &&
+      layer->GetPhysicalDeviceSurfaceCapabilities2KHR != nullptr;
+
   {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lk(g_instance_mutex);
+    g_instances[layer->instance] = layer;
+  }
+  log("instance created; mode=%d", static_cast<int>(g_cfg.mode));
+  return res;
+}
+
+// Map physical devices back to their InstanceLayer so CreateDevice can resolve
+// instance-level helpers (extension enum, features, surface caps).
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkEnumeratePhysicalDevices(VkInstance instance, uint32_t *pPhysicalDeviceCount,
+                           VkPhysicalDevice *pPhysicalDevices) {
+  InstanceLayer *layer = get_instance(instance);
+  if (!layer || !layer->GetInstanceProcAddr)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  auto *fp = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(
+      layer->GetInstanceProcAddr(instance, "vkEnumeratePhysicalDevices"));
+  if (!fp)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  VkResult res = fp(instance, pPhysicalDeviceCount, pPhysicalDevices);
+  if ((res == VK_SUCCESS || res == VK_INCOMPLETE) && pPhysicalDevices) {
+    std::lock_guard<std::mutex> lk(g_instance_mutex);
+    for (uint32_t i = 0; i < *pPhysicalDeviceCount; i++)
+      g_phys_devices[pPhysicalDevices[i]] = layer;
+  }
+  return res;
+}
+
+InstanceLayer *instance_for_physical_device(VkPhysicalDevice pd) {
+  std::lock_guard<std::mutex> lk(g_instance_mutex);
+  auto it = g_phys_devices.find(pd);
+  return it == g_phys_devices.end() ? nullptr : it->second;
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+vkDestroyInstance(VkInstance instance, const VkAllocationCallbacks *pAllocator) {
+  InstanceLayer *layer = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_instance_mutex);
     auto it = g_instances.find(instance);
     if (it != g_instances.end()) {
-      inst = it->second;
-      for (auto p = g_phys_instances.begin(); p != g_phys_instances.end();) {
-        if (p->second == &it->second)
-          p = g_phys_instances.erase(p);
-        else
-          ++p;
-      }
+      layer = it->second;
       g_instances.erase(it);
     }
   }
-
-  if (inst.DestroyInstance)
-    inst.DestroyInstance(instance, pAllocator);
-}
-
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkEnumeratePhysicalDevices(
-    VkInstance instance,
-    uint32_t* pPhysicalDeviceCount,
-    VkPhysicalDevice* pPhysicalDevices) {
-  InstanceDispatch* inst = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_instances.find(instance);
-    if (it != g_instances.end())
-      inst = &it->second;
-  }
-
-  if (!inst || !inst->EnumeratePhysicalDevices)
-    return VK_ERROR_INITIALIZATION_FAILED;
-
-  VkResult r = inst->EnumeratePhysicalDevices(instance, pPhysicalDeviceCount, pPhysicalDevices);
-  if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && pPhysicalDevices && pPhysicalDeviceCount) {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_instances.find(instance);
-    if (it != g_instances.end()) {
-      for (uint32_t i = 0; i < *pPhysicalDeviceCount; i++)
-        g_phys_instances[pPhysicalDevices[i]] = &it->second;
+  if (layer) {
+    if (layer->GetInstanceProcAddr) {
+      auto *fp = reinterpret_cast<PFN_vkDestroyInstance>(
+          layer->GetInstanceProcAddr(instance, "vkDestroyInstance"));
+      if (fp)
+        fp(instance, pAllocator);
     }
+    delete layer;
   }
-
-  return r;
 }
 
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkCreateDevice(
-    VkPhysicalDevice physicalDevice,
-    const VkDeviceCreateInfo* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkDevice* pDevice) {
-  auto* chain = get_layer_link_info<VkLayerDeviceCreateInfo*>(
-      pCreateInfo->pNext, VK_LAYER_LINK_INFO, VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO);
-  if (!chain || !chain->u.pLayerInfo)
+// ---- Device ----
+
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkCreateDevice(VkPhysicalDevice physicalDevice,
+               const VkDeviceCreateInfo *pCreateInfo,
+               const VkAllocationCallbacks *pAllocator, VkDevice *pDevice) {
+  // Resolve the down-chain gipa/dgpa from the loader's device layer link.
+  VkLayerDeviceCreateInfo *link = get_device_link(pCreateInfo->pNext);
+  if (!link || !link->u.pLayerInfo) {
+    log("vkCreateDevice: no loader device link in chain");
     return VK_ERROR_INITIALIZATION_FAILED;
-
-  PFN_vkGetDeviceProcAddr next_gdpa = chain->u.pLayerInfo->pfnNextGetDeviceProcAddr;
-  chain->u.pLayerInfo = chain->u.pLayerInfo->pNext;
-
-  InstanceDispatch* inst = nullptr;
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto it = g_phys_instances.find(physicalDevice);
-    if (it != g_phys_instances.end())
-      inst = it->second;
   }
-
-  if (!inst || !inst->CreateDevice)
+  VkLayerDeviceLink *layer_link = link->u.pLayerInfo;
+  PFN_vkGetInstanceProcAddr chain_gipa =
+      layer_link->pfnNextGetInstanceProcAddr;
+  PFN_vkGetDeviceProcAddr next_dgpa =
+      layer_link->pfnNextGetDeviceProcAddr;
+  if (!chain_gipa || !next_dgpa) {
+    log("vkCreateDevice: missing chain proc-addrs");
     return VK_ERROR_INITIALIZATION_FAILED;
-
-  uint32_t ext_count = 0;
-  std::vector<VkExtensionProperties> exts;
-  if (inst->EnumerateDeviceExtensionProperties &&
-      inst->EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &ext_count, nullptr) == VK_SUCCESS) {
-    exts.resize(ext_count);
-    inst->EnumerateDeviceExtensionProperties(physicalDevice, nullptr, &ext_count, exts.data());
   }
+  PFN_vkCreateDevice chain_create = reinterpret_cast<PFN_vkCreateDevice>(
+      chain_gipa(VK_NULL_HANDLE, "vkCreateDevice"));
 
-  const bool swapchain_ext = name_in_list(VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-      pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
-  const bool app_present_id_ext = name_in_list(VK_KHR_PRESENT_ID_EXTENSION_NAME,
-      pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
-  const bool app_present_wait_ext = name_in_list(VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
-      pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
-  const bool app_present_id2_ext = name_in_list(VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
-      pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
-  const bool app_calibrated_timestamps_ext = name_in_list(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME,
-      pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
-  const bool app_present_timing_ext = name_in_list(VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
-      pCreateInfo->enabledExtensionCount, pCreateInfo->ppEnabledExtensionNames);
+  // The instance that owns this physical device (for extension/feature/caps
+  // queries). Falls back to null gracefully.
+  InstanceLayer *inst = instance_for_physical_device(physicalDevice);
 
-  bool support_present_id = false;
-  bool support_present_wait = false;
-  bool support_present_id2 = false;
-  bool support_present_timing = false;
-
-  if (g_cap_active && g_want_present_wait && swapchain_ext && inst->GetPhysicalDeviceFeatures2) {
-    VkPhysicalDevicePresentWaitFeaturesKHR present_wait_features{};
-    present_wait_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
-
-    VkPhysicalDevicePresentIdFeaturesKHR present_id_features{};
-    present_id_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
-    present_id_features.pNext = &present_wait_features;
-
-    VkPhysicalDeviceFeatures2 features2{};
-    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &present_id_features;
-
-    inst->GetPhysicalDeviceFeatures2(physicalDevice, &features2);
-
-    support_present_id = has_extension(exts, VK_KHR_PRESENT_ID_EXTENSION_NAME) && present_id_features.presentId;
-    support_present_wait = support_present_id
-        && has_extension(exts, VK_KHR_PRESENT_WAIT_EXTENSION_NAME)
-        && present_wait_features.presentWait;
-  }
-
-  if (g_want_present_timing && g_scanline.active && swapchain_ext && inst->GetPhysicalDeviceFeatures2) {
-    VkPhysicalDevicePresentTimingFeaturesEXT present_timing_features{};
-    present_timing_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
-
-    VkPhysicalDevicePresentId2FeaturesKHR present_id2_features{};
-    present_id2_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
-    present_id2_features.pNext = &present_timing_features;
-
-    VkPhysicalDeviceFeatures2 features2{};
-    features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &present_id2_features;
-
-    inst->GetPhysicalDeviceFeatures2(physicalDevice, &features2);
-
-    support_present_id2 = has_extension(exts, VK_KHR_PRESENT_ID_2_EXTENSION_NAME) && present_id2_features.presentId2;
-    support_present_timing = support_present_id2
-        && has_extension(exts, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME)
-        && has_extension(exts, VK_EXT_PRESENT_TIMING_EXTENSION_NAME)
-        && present_timing_features.presentTiming;
-  }
-
-  const auto* app_present_id_features = find_pnext<VkPhysicalDevicePresentIdFeaturesKHR>(
-      pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR);
-  const auto* app_present_wait_features = find_pnext<VkPhysicalDevicePresentWaitFeaturesKHR>(
-      pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR);
-  const auto* app_present_id2_features = find_pnext<VkPhysicalDevicePresentId2FeaturesKHR>(
-      pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR);
-  const auto* app_present_timing_features = find_pnext<VkPhysicalDevicePresentTimingFeaturesEXT>(
-      pCreateInfo->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT);
-
-  // If the app explicitly provided presentId = VK_FALSE, do not force the
-  // present-wait path since wait requires usable present IDs.
-  if (support_present_id && app_present_id_features && !app_present_id_features->presentId) {
-    support_present_id = false;
-    support_present_wait = false;
-  }
-
-  if (support_present_wait && app_present_wait_features && !app_present_wait_features->presentWait)
-    support_present_wait = false;
-
-  if (support_present_id2 && app_present_id2_features && !app_present_id2_features->presentId2) {
-    support_present_id2 = false;
-    support_present_timing = false;
-  }
-
-  if (support_present_timing && app_present_timing_features && !app_present_timing_features->presentTiming)
-    support_present_timing = false;
-
-  std::vector<const char*> enabled_exts;
-  enabled_exts.reserve(pCreateInfo->enabledExtensionCount + 5);
-  for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++)
-    enabled_exts.push_back(pCreateInfo->ppEnabledExtensionNames[i]);
-
-  if (support_present_id && !app_present_id_ext)
-    enabled_exts.push_back(VK_KHR_PRESENT_ID_EXTENSION_NAME);
-  if (support_present_wait && !app_present_wait_ext)
-    enabled_exts.push_back(VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
-  if (support_present_id2 && !app_present_id2_ext)
-    enabled_exts.push_back(VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
-  if (support_present_timing && !app_calibrated_timestamps_ext)
-    enabled_exts.push_back(VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
-  if (support_present_timing && !app_present_timing_ext)
-    enabled_exts.push_back(VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
-
-  VkPhysicalDevicePresentWaitFeaturesKHR enable_present_wait{};
-  enable_present_wait.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
-  enable_present_wait.presentWait = VK_TRUE;
-
-  VkPhysicalDevicePresentIdFeaturesKHR enable_present_id{};
-  enable_present_id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
-  enable_present_id.presentId = VK_TRUE;
-
-  VkPhysicalDevicePresentId2FeaturesKHR enable_present_id2{};
-  enable_present_id2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_2_FEATURES_KHR;
-  enable_present_id2.presentId2 = VK_TRUE;
-
-  VkPhysicalDevicePresentTimingFeaturesEXT enable_present_timing{};
-  enable_present_timing.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
-  enable_present_timing.presentTiming = VK_TRUE;
-
-  VkDeviceCreateInfo create_info = *pCreateInfo;
-  create_info.enabledExtensionCount = static_cast<uint32_t>(enabled_exts.size());
-  create_info.ppEnabledExtensionNames = enabled_exts.data();
-
-  bool layer_enabled_present_id_feature = false;
-  bool layer_enabled_present_wait_feature = false;
-  bool layer_enabled_present_id2_feature = false;
-  bool layer_enabled_present_timing_feature = false;
-
-  if (support_present_timing && !app_present_timing_features) {
-    enable_present_timing.pNext = const_cast<void*>(create_info.pNext);
-    create_info.pNext = &enable_present_timing;
-    layer_enabled_present_timing_feature = true;
-  }
-
-  if (support_present_id2 && !app_present_id2_features) {
-    enable_present_id2.pNext = const_cast<void*>(create_info.pNext);
-    create_info.pNext = &enable_present_id2;
-    layer_enabled_present_id2_feature = true;
-  }
-
-  if (support_present_wait && !app_present_wait_features) {
-    enable_present_wait.pNext = const_cast<void*>(create_info.pNext);
-    create_info.pNext = &enable_present_wait;
-    layer_enabled_present_wait_feature = true;
-  }
-
-  if (support_present_id && !app_present_id_features) {
-    enable_present_id.pNext = const_cast<void*>(create_info.pNext);
-    create_info.pNext = &enable_present_id;
-    layer_enabled_present_id_feature = true;
-  }
-
-  VkResult r = inst->CreateDevice(physicalDevice, &create_info, pAllocator, pDevice);
-  if (r != VK_SUCCESS)
-    return r;
-
-  auto dev = std::make_unique<DeviceDispatch>();
-  dev->device = *pDevice;
-  dev->physical_device = physicalDevice;
+  auto *dev = new DeviceLayer();
+  dev->physicalDevice = physicalDevice;
   dev->instance = inst;
-  dev->GetDeviceProcAddr = next_gdpa;
-  dev->DestroyDevice = reinterpret_cast<PFN_vkDestroyDevice>(next_gdpa(*pDevice, "vkDestroyDevice"));
-  dev->GetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(next_gdpa(*pDevice, "vkGetDeviceQueue"));
-  dev->GetDeviceQueue2 = reinterpret_cast<PFN_vkGetDeviceQueue2>(next_gdpa(*pDevice, "vkGetDeviceQueue2"));
-  dev->QueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(next_gdpa(*pDevice, "vkQueuePresentKHR"));
-  dev->WaitForPresentKHR = reinterpret_cast<PFN_vkWaitForPresentKHR>(next_gdpa(*pDevice, "vkWaitForPresentKHR"));
-  dev->AcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(next_gdpa(*pDevice, "vkAcquireNextImageKHR"));
-  dev->AcquireNextImage2KHR = reinterpret_cast<PFN_vkAcquireNextImage2KHR>(next_gdpa(*pDevice, "vkAcquireNextImage2KHR"));
-  dev->CreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(next_gdpa(*pDevice, "vkCreateSwapchainKHR"));
-  dev->DestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(next_gdpa(*pDevice, "vkDestroySwapchainKHR"));
-  dev->SetSwapchainPresentTimingQueueSizeEXT = reinterpret_cast<PFN_vkSetSwapchainPresentTimingQueueSizeEXT>(next_gdpa(*pDevice, "vkSetSwapchainPresentTimingQueueSizeEXT"));
-  dev->GetSwapchainTimingPropertiesEXT = reinterpret_cast<PFN_vkGetSwapchainTimingPropertiesEXT>(next_gdpa(*pDevice, "vkGetSwapchainTimingPropertiesEXT"));
-  dev->GetPastPresentationTimingEXT = reinterpret_cast<PFN_vkGetPastPresentationTimingEXT>(next_gdpa(*pDevice, "vkGetPastPresentationTimingEXT"));
 
-  const bool id_feature_enabled = layer_enabled_present_id_feature
-      || (app_present_id_features && app_present_id_features->presentId);
-  const bool wait_feature_enabled = layer_enabled_present_wait_feature
-      || (app_present_wait_features && app_present_wait_features->presentWait);
-  const bool id2_feature_enabled = layer_enabled_present_id2_feature
-      || (app_present_id2_features && app_present_id2_features->presentId2);
-  const bool timing_feature_enabled = layer_enabled_present_timing_feature
-      || (app_present_timing_features && app_present_timing_features->presentTiming);
+  // Decide which of our extensions to enable, based on availability + config.
+  bool want_pid = g_cfg.want_present_wait || g_cfg.want_present_timing;
+  bool want_pwait = g_cfg.want_present_wait;
+  bool want_ptiming = g_cfg.want_present_timing;
+  bool want_calib = g_cfg.want_present_timing;
 
-  dev->present_id_enabled = name_in_list(VK_KHR_PRESENT_ID_EXTENSION_NAME,
-      create_info.enabledExtensionCount, create_info.ppEnabledExtensionNames) && id_feature_enabled;
-  dev->present_wait_enabled = name_in_list(VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
-      create_info.enabledExtensionCount, create_info.ppEnabledExtensionNames)
-      && wait_feature_enabled && dev->WaitForPresentKHR;
-  dev->present_timing_enabled = name_in_list(VK_EXT_PRESENT_TIMING_EXTENSION_NAME,
-      create_info.enabledExtensionCount, create_info.ppEnabledExtensionNames)
-      && name_in_list(VK_KHR_PRESENT_ID_2_EXTENSION_NAME,
-          create_info.enabledExtensionCount, create_info.ppEnabledExtensionNames)
-      && id2_feature_enabled && timing_feature_enabled && dev->GetSwapchainTimingPropertiesEXT && dev->GetPastPresentationTimingEXT;
+  bool have_pid = want_pid && device_has_extension(inst, physicalDevice,
+                                                   VK_KHR_PRESENT_ID_EXTENSION_NAME);
+  bool have_pwait =
+      want_pwait && device_has_extension(inst, physicalDevice,
+                                         VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+  bool have_ptiming =
+      want_ptiming && device_has_extension(inst, physicalDevice,
+                                           VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+  bool have_calib =
+      want_calib && device_has_extension(inst, physicalDevice,
+                                         VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 
-  {
-    std::lock_guard<std::mutex> lock(g_mutex);
-    auto raw = dev.get();
-    g_devices.emplace(*pDevice, std::move(dev));
-    log("created device: present_id=%d present_wait=%d present_timing=%d scanline=%d",
-        raw->present_id_enabled, raw->present_wait_enabled,
-        raw->present_timing_enabled, g_scanline.active);
+  // Query feature support before enabling feature structs.
+  bool feat_pid = false, feat_pwait = false, feat_ptiming = false;
+  if (inst && inst->GetPhysicalDeviceFeatures2) {
+    VkPhysicalDevicePresentIdFeaturesKHR f_pid{};
+    f_pid.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+    VkPhysicalDevicePresentWaitFeaturesKHR f_pwait{};
+    f_pwait.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+    f_pwait.pNext = &f_pid;
+    VkPhysicalDevicePresentTimingFeaturesEXT f_ptiming{};
+    f_ptiming.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
+    f_ptiming.pNext = &f_pwait;
+    VkPhysicalDeviceFeatures2 f2{};
+    f2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+    f2.pNext = &f_ptiming;
+    inst->GetPhysicalDeviceFeatures2(physicalDevice, &f2);
+    feat_pid = have_pid && f_pid.presentId;
+    feat_pwait = have_pwait && f_pwait.presentWait;
+    feat_ptiming = have_ptiming && f_ptiming.presentTiming;
+  } else {
+    // No Features2: assume supported if the extension is present.
+    feat_pid = have_pid;
+    feat_pwait = have_pwait;
+    feat_ptiming = have_ptiming;
   }
 
-  return VK_SUCCESS;
-}
+  // Build a new extension list.
+  std::vector<const char *> exts;
+  if (pCreateInfo->ppEnabledExtensionNames) {
+    for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++)
+      exts.push_back(pCreateInfo->ppEnabledExtensionNames[i]);
+  }
+  auto add_ext = [&](bool cond, const char *name) {
+    if (!cond)
+      return;
+    for (auto *e : exts)
+      if (std::strcmp(e, name) == 0)
+        return;
+    exts.push_back(name);
+  };
+  add_ext(feat_pid, VK_KHR_PRESENT_ID_EXTENSION_NAME);
+  add_ext(feat_pwait, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
+  add_ext(feat_ptiming, VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+  add_ext(have_calib, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 
-VK_LAYER_EXPORT void VKAPI_CALL vkDestroyDevice(
-    VkDevice device,
-    const VkAllocationCallbacks* pAllocator) {
-  PFN_vkDestroyDevice destroy = nullptr;
-  DeviceDispatch* raw = nullptr;
+  // Build a feature pNext chain to enable them.
+  VkPhysicalDevicePresentIdFeaturesKHR en_pid{};
+  en_pid.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
+  VkPhysicalDevicePresentWaitFeaturesKHR en_pwait{};
+  en_pwait.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR;
+  VkPhysicalDevicePresentTimingFeaturesEXT en_ptiming{};
+  en_ptiming.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT;
+
+  void *feat_head = const_cast<void *>(pCreateInfo->pNext);
+  if (feat_ptiming) {
+    en_ptiming.presentTiming = VK_TRUE;
+    en_ptiming.presentAtAbsoluteTime = VK_TRUE;
+    en_ptiming.pNext = feat_head;
+    feat_head = &en_ptiming;
+  }
+  if (feat_pwait) {
+    en_pwait.presentWait = VK_TRUE;
+    en_pwait.pNext = feat_head;
+    feat_head = &en_pwait;
+  }
+  if (feat_pid) {
+    en_pid.presentId = VK_TRUE;
+    en_pid.pNext = feat_head;
+    feat_head = &en_pid;
+  }
+
+  VkDeviceCreateInfo ci = *pCreateInfo;
+  ci.ppEnabledExtensionNames = exts.data();
+  ci.enabledExtensionCount = static_cast<uint32_t>(exts.size());
+  ci.pNext = feat_head;
+
+  // Advance the link so the next layer in the chain sees its own link info.
+  link->u.pLayerInfo = layer_link->pNext;
+
+  VkResult res = chain_create(physicalDevice, &ci, pAllocator, pDevice);
+  if (res != VK_SUCCESS) {
+    delete dev;
+    return res;
+  }
+
+  dev->device = *pDevice;
+  dev->GetDeviceProcAddr = next_dgpa;
+
+  if (dev->GetDeviceProcAddr) {
+    auto *d = dev->GetDeviceProcAddr;
+    dev->GetDeviceQueue = reinterpret_cast<PFN_vkGetDeviceQueue>(
+        d(*pDevice, "vkGetDeviceQueue"));
+    dev->GetDeviceQueue2 = reinterpret_cast<PFN_vkGetDeviceQueue2>(
+        d(*pDevice, "vkGetDeviceQueue2"));
+    dev->CreateSwapchainKHR = reinterpret_cast<PFN_vkCreateSwapchainKHR>(
+        d(*pDevice, "vkCreateSwapchainKHR"));
+    dev->DestroySwapchainKHR = reinterpret_cast<PFN_vkDestroySwapchainKHR>(
+        d(*pDevice, "vkDestroySwapchainKHR"));
+    dev->AcquireNextImageKHR = reinterpret_cast<PFN_vkAcquireNextImageKHR>(
+        d(*pDevice, "vkAcquireNextImageKHR"));
+    dev->AcquireNextImage2KHR = reinterpret_cast<PFN_vkAcquireNextImage2KHR>(
+        d(*pDevice, "vkAcquireNextImage2KHR"));
+    dev->QueuePresentKHR = reinterpret_cast<PFN_vkQueuePresentKHR>(
+        d(*pDevice, "vkQueuePresentKHR"));
+    dev->DeviceWaitIdle = reinterpret_cast<PFN_vkDeviceWaitIdle>(
+        d(*pDevice, "vkDeviceWaitIdle"));
+    dev->WaitForPresentKHR = reinterpret_cast<PFN_vkWaitForPresentKHR>(
+        d(*pDevice, "vkWaitForPresentKHR"));
+    dev->SetSwapchainPresentTimingQueueSizeEXT =
+        reinterpret_cast<PFN_vkSetSwapchainPresentTimingQueueSizeEXT>(
+            d(*pDevice, "vkSetSwapchainPresentTimingQueueSizeEXT"));
+    dev->GetSwapchainTimingPropertiesEXT =
+        reinterpret_cast<PFN_vkGetSwapchainTimingPropertiesEXT>(
+            d(*pDevice, "vkGetSwapchainTimingPropertiesEXT"));
+    dev->GetSwapchainTimeDomainPropertiesEXT =
+        reinterpret_cast<PFN_vkGetSwapchainTimeDomainPropertiesEXT>(
+            d(*pDevice, "vkGetSwapchainTimeDomainPropertiesEXT"));
+    dev->GetPastPresentationTimingEXT =
+        reinterpret_cast<PFN_vkGetPastPresentationTimingEXT>(
+            d(*pDevice, "vkGetPastPresentationTimingEXT"));
+    dev->GetCalibratedTimestampsKHR =
+        reinterpret_cast<PFN_vkGetCalibratedTimestampsKHR>(
+            d(*pDevice, "vkGetCalibratedTimestampsKHR"));
+  }
+
+  dev->present_id_enabled = feat_pid;
+  dev->present_wait_enabled = feat_pwait;
+  dev->present_timing_enabled = feat_ptiming;
 
   {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lk(g_device_mutex);
+    g_devices[dev->device] = dev;
+  }
+  log("device created; pid=%d pwait=%d ptiming=%d calib=%d",
+      feat_pid ? 1 : 0, feat_pwait ? 1 : 0, feat_ptiming ? 1 : 0,
+      have_calib ? 1 : 0);
+  return res;
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+vkDestroyDevice(VkDevice device, const VkAllocationCallbacks *pAllocator) {
+  DeviceLayer *dev = nullptr;
+  {
+    std::lock_guard<std::mutex> lk(g_device_mutex);
     auto it = g_devices.find(device);
     if (it != g_devices.end()) {
-      raw = it->second.get();
-      destroy = raw->DestroyDevice;
-
-      for (auto q = g_queues.begin(); q != g_queues.end();) {
-        if (q->second == raw)
-          q = g_queues.erase(q);
-        else
-          ++q;
-      }
-
+      dev = it->second;
       g_devices.erase(it);
     }
   }
-
-  if (destroy)
-    destroy(device, pAllocator);
+  if (dev) {
+    // Clean up queue map entries for this device.
+    {
+      std::lock_guard<std::mutex> lk(g_queue_mutex);
+      for (auto it = g_queues.begin(); it != g_queues.end();) {
+        if (it->second == dev)
+          it = g_queues.erase(it);
+        else
+          ++it;
+      }
+    }
+    if (dev->DeviceWaitIdle)
+      dev->DeviceWaitIdle(device);
+    if (dev->GetDeviceProcAddr) {
+      auto *fp = reinterpret_cast<PFN_vkDestroyDevice>(
+          dev->GetDeviceProcAddr(device, "vkDestroyDevice"));
+      if (fp)
+        fp(device, pAllocator);
+    }
+    delete dev;
+  }
 }
 
-VK_LAYER_EXPORT void VKAPI_CALL vkGetDeviceQueue(
-    VkDevice device,
-    uint32_t queueFamilyIndex,
-    uint32_t queueIndex,
-    VkQueue* pQueue) {
-  DeviceDispatch* dev = get_device_dispatch(device);
-  if (!dev || !dev->GetDeviceQueue)
+// ---- Queues ----
+
+VK_LAYER_EXPORT void VKAPI_CALL
+vkGetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex,
+                 VkQueue *pQueue) {
+  DeviceLayer *dev = get_device(device);
+  if (!dev || !dev->GetDeviceQueue) {
+    // Without our dispatch this device was not created through us.
     return;
-
+  }
   dev->GetDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue);
-
   if (pQueue && *pQueue) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lk(g_queue_mutex);
     g_queues[*pQueue] = dev;
   }
 }
 
-VK_LAYER_EXPORT void VKAPI_CALL vkGetDeviceQueue2(
-    VkDevice device,
-    const VkDeviceQueueInfo2* pQueueInfo,
-    VkQueue* pQueue) {
-  DeviceDispatch* dev = get_device_dispatch(device);
+VK_LAYER_EXPORT void VKAPI_CALL
+vkGetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2 *pQueueInfo,
+                  VkQueue *pQueue) {
+  DeviceLayer *dev = get_device(device);
   if (!dev || !dev->GetDeviceQueue2)
     return;
-
   dev->GetDeviceQueue2(device, pQueueInfo, pQueue);
-
   if (pQueue && *pQueue) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+    std::lock_guard<std::mutex> lk(g_queue_mutex);
     g_queues[*pQueue] = dev;
   }
 }
 
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkCreateWaylandSurfaceKHR(
-    VkInstance instance,
-    const VkWaylandSurfaceCreateInfoKHR* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkSurfaceKHR* pSurface) {
-  InstanceDispatch* inst = get_instance_dispatch(instance);
-  if (!inst || !inst->CreateWaylandSurfaceKHR)
-    return VK_ERROR_INITIALIZATION_FAILED;
+// ---- Swapchain ----
 
-  VkResult r = inst->CreateWaylandSurfaceKHR(instance, pCreateInfo, pAllocator, pSurface);
-  if (g_cap_active && r == VK_SUCCESS && pCreateInfo && pSurface && *pSurface)
-    vfc::key_input::init_wayland_display(pCreateInfo->display, reinterpret_cast<void*>(*pSurface));
-
-  return r;
-}
-
-VK_LAYER_EXPORT void VKAPI_CALL vkDestroySurfaceKHR(
-    VkInstance instance,
-    VkSurfaceKHR surface,
-    const VkAllocationCallbacks* pAllocator) {
-  InstanceDispatch* inst = get_instance_dispatch(instance);
-
-  vfc::key_input::unref_wayland_surface(reinterpret_cast<void*>(surface));
-
-  if (inst && inst->DestroySurfaceKHR)
-    inst->DestroySurfaceKHR(instance, surface, pAllocator);
-}
-
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkAcquireNextImageKHR(
-    VkDevice device,
-    VkSwapchainKHR swapchain,
-    uint64_t timeout,
-    VkSemaphore semaphore,
-    VkFence fence,
-    uint32_t* pImageIndex) {
-  DeviceDispatch* dev = get_device_dispatch(device);
-  if (!dev || !dev->AcquireNextImageKHR)
-    return VK_ERROR_INITIALIZATION_FAILED;
-
-  scanline_acquire_delay(dev, swapchain);
-  VkResult r = dev->AcquireNextImageKHR(device, swapchain, timeout, semaphore, fence, pImageIndex);
-  scanline_mark_acquire_done(dev, swapchain, r);
-  return r;
-}
-
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkAcquireNextImage2KHR(
-    VkDevice device,
-    const VkAcquireNextImageInfoKHR* pAcquireInfo,
-    uint32_t* pImageIndex) {
-  DeviceDispatch* dev = get_device_dispatch(device);
-  if (!dev || !dev->AcquireNextImage2KHR)
-    return VK_ERROR_INITIALIZATION_FAILED;
-
-  if (pAcquireInfo)
-    scanline_acquire_delay(dev, pAcquireInfo->swapchain);
-  VkResult r = dev->AcquireNextImage2KHR(device, pAcquireInfo, pImageIndex);
-  if (pAcquireInfo)
-    scanline_mark_acquire_done(dev, pAcquireInfo->swapchain, r);
-  return r;
-}
-
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkCreateSwapchainKHR(
-    VkDevice device,
-    const VkSwapchainCreateInfoKHR* pCreateInfo,
-    const VkAllocationCallbacks* pAllocator,
-    VkSwapchainKHR* pSwapchain) {
-  DeviceDispatch* dev = get_device_dispatch(device);
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInfo,
+                     const VkAllocationCallbacks *pAllocator,
+                     VkSwapchainKHR *pSwapchain) {
+  DeviceLayer *dev = get_device(device);
   if (!dev || !dev->CreateSwapchainKHR)
     return VK_ERROR_INITIALIZATION_FAILED;
 
-  VkSwapchainCreateInfoKHR create_info = *pCreateInfo;
-  SurfaceTimingCaps timing_caps{};
+  VkSwapchainCreateInfoKHR ci = *pCreateInfo;
 
-  if (g_scanline.active) {
-    if (surface_supports_present_mode(dev, pCreateInfo->surface, VK_PRESENT_MODE_IMMEDIATE_KHR)) {
-      if (create_info.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR)
-        log("scanline: forcing IMMEDIATE present mode (was %d)", create_info.presentMode);
-      create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
-    } else {
-      log("scanline: IMMEDIATE present mode is not available; preserving mode %d", create_info.presentMode);
-    }
-
-    if (dev->present_timing_enabled) {
-      timing_caps = query_surface_timing_caps(dev, pCreateInfo->surface);
-      // If surface-capabilities2 was not enabled by the app, the caps query may
-      // be unavailable even though the device/runtime supports present timing.
-      // Try the swapchain flag anyway and fall back if the WSI rejects it.
-      create_info.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
-    }
-  }
-
-  VkResult r = dev->CreateSwapchainKHR(device, &create_info, pAllocator, pSwapchain);
-  if (r != VK_SUCCESS && (create_info.flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT)) {
-    log("scanline: present timing swapchain flag failed (%d), retrying without it", r);
-    create_info.flags &= ~VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
-    timing_caps = {};
-    r = dev->CreateSwapchainKHR(device, &create_info, pAllocator, pSwapchain);
-  }
-  if (r == VK_SUCCESS && pCreateInfo && pSwapchain && *pSwapchain) {
-    SwapchainState state{};
-    state.present_mode = create_info.presentMode;
-    state.extent = create_info.imageExtent;
-    state.refresh_ns = g_scanline_fallback_refresh_ns;
-    state.present_timing_requested = !!(create_info.flags & VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT);
-    state.first_pixel_out_supported = timing_caps.first_pixel_out;
-    if (g_scanline.active && state.present_timing_requested) {
-      if (dev->SetSwapchainPresentTimingQueueSizeEXT) {
-        VkResult qr = dev->SetSwapchainPresentTimingQueueSizeEXT(device, *pSwapchain, 8);
-        if (qr != VK_SUCCESS)
-          log("scanline: vkSetSwapchainPresentTimingQueueSizeEXT returned %d", qr);
-      }
-      bool measured = false;
-      state.refresh_ns = query_swapchain_refresh_ns(dev, *pSwapchain, &measured);
-      state.refresh_measured = measured;
-    }
-    state.render_lead = scanline_default_render_lead(state.refresh_ns);
-
-    std::lock_guard<std::mutex> lock(dev->present_mutex);
-    dev->present_modes[*pSwapchain] = create_info.presentMode;
-    dev->swapchains[*pSwapchain] = state;
-    log("created swapchain: present mode %d extent=%ux%u refresh=%llu ns timing=%d",
-        create_info.presentMode, create_info.imageExtent.width, create_info.imageExtent.height,
-        static_cast<unsigned long long>(state.refresh_ns), state.present_timing_requested);
-  }
-
-  return r;
-}
-
-VK_LAYER_EXPORT void VKAPI_CALL vkDestroySwapchainKHR(
-    VkDevice device,
-    VkSwapchainKHR swapchain,
-    const VkAllocationCallbacks* pAllocator) {
-  DeviceDispatch* dev = get_device_dispatch(device);
-  if (!dev || !dev->DestroySwapchainKHR)
-    return;
-
-  {
-    std::lock_guard<std::mutex> lock(dev->present_mutex);
-    dev->present_ids.erase(swapchain);
-    dev->present_modes.erase(swapchain);
-    dev->swapchains.erase(swapchain);
-  }
-
-  dev->DestroySwapchainKHR(device, swapchain, pAllocator);
-}
-
-VK_LAYER_EXPORT VkResult VKAPI_CALL vkQueuePresentKHR(
-    VkQueue queue,
-    const VkPresentInfoKHR* pPresentInfo) {
-  DeviceDispatch* dev = get_queue_dispatch(queue);
-  if (!dev || !dev->QueuePresentKHR)
-    return VK_ERROR_INITIALIZATION_FAILED;
-
-  if (g_cap_active)
-    check_hotkeys();
-  bool limiter_enabled = g_limiter.enabled();
-
-  VkPresentInfoKHR info = *pPresentInfo;
-  VkPresentIdKHR present_id{};
-  present_id.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
-
-  std::vector<uint64_t> ids;
-  std::vector<uint8_t> wait_swapchain(pPresentInfo->swapchainCount, 0);
-
-  const auto* app_present_id = find_pnext<VkPresentIdKHR>(pPresentInfo->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR);
-  const auto* present_mode_info = find_pnext<VkSwapchainPresentModeInfoEXT>(
-      pPresentInfo->pNext, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODE_INFO_EXT);
-
-  if (g_scanline.active) {
-    // Conservative scanline mode: do not inject VkPresentTimingsInfoEXT yet.
-    // The previous diagnostic path (timing injection + feedback polling) could
-    // freeze some games at launch. Keep scanline pacing stable for now;
-    // present-timing feedback PLL can be re-enabled later behind a safer
-    // implementation.
-    scanline_present_delay(dev, pPresentInfo, present_mode_info);
-    return dev->QueuePresentKHR(queue, &info);
-  }
-
-  bool need_present_wait = limiter_enabled && g_want_present_wait && dev->present_wait_enabled;
-  if (need_present_wait) {
-    bool any_wait = false;
-
-    for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-      VkPresentModeKHR mode = get_present_mode(dev, pPresentInfo->pSwapchains[i], present_mode_info, i);
-      wait_swapchain[i] = should_wait_for_present_mode(mode) ? 1 : 0;
-      any_wait |= wait_swapchain[i] != 0;
-    }
-
-    need_present_wait = any_wait;
-  }
-
-  if (need_present_wait && dev->present_id_enabled && pPresentInfo->swapchainCount && !app_present_id) {
-    ids.resize(pPresentInfo->swapchainCount);
-
-    {
-      std::lock_guard<std::mutex> lock(dev->present_mutex);
-      for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++)
-        ids[i] = ++dev->present_ids[pPresentInfo->pSwapchains[i]];
-    }
-
-    present_id.swapchainCount = pPresentInfo->swapchainCount;
-    present_id.pPresentIds = ids.data();
-    present_id.pNext = info.pNext;
-    info.pNext = &present_id;
-  } else if (need_present_wait && app_present_id && app_present_id->swapchainCount == pPresentInfo->swapchainCount && app_present_id->pPresentIds) {
-    ids.assign(app_present_id->pPresentIds, app_present_id->pPresentIds + app_present_id->swapchainCount);
-  }
-
-  VkResult r = dev->QueuePresentKHR(queue, &info);
-
-  if (limiter_enabled && (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR)) {
-    if (need_present_wait && !ids.empty()) {
-      for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++) {
-        if (!wait_swapchain[i])
-          continue;
-
-        VkResult wr = dev->WaitForPresentKHR(dev->device, pPresentInfo->pSwapchains[i], ids[i], UINT64_MAX);
-        if (wr != VK_SUCCESS) {
-          log("vkWaitForPresentKHR returned %d", wr);
-          break;
+  // Force IMMEDIATE present mode in scanline mode (so the tear line is movable).
+  bool forced_immediate = false;
+  if (g_cfg.mode == Mode::ScanlineSync && g_cfg.force_immediate &&
+      ci.presentMode != VK_PRESENT_MODE_IMMEDIATE_KHR &&
+      dev->instance && dev->instance->GetPhysicalDeviceSurfacePresentModesKHR) {
+    uint32_t count = 0;
+    VkResult r = dev->instance->GetPhysicalDeviceSurfacePresentModesKHR(
+        dev->physicalDevice, ci.surface, &count, nullptr);
+    if (r == VK_SUCCESS && count) {
+      std::vector<VkPresentModeKHR> modes(count);
+      r = dev->instance->GetPhysicalDeviceSurfacePresentModesKHR(
+          dev->physicalDevice, ci.surface, &count, modes.data());
+      if (r == VK_SUCCESS) {
+        for (auto m : modes) {
+          if (m == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+            ci.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+            forced_immediate = true;
+            break;
+          }
         }
       }
     }
-
-    g_limiter.delay();
+    if (!forced_immediate)
+      log("scanline: VK_PRESENT_MODE_IMMEDIATE_KHR not available; "
+          "tearline cannot be moved");
   }
 
-  return r;
+  // Query present-timing caps for this surface.
+  if (g_cfg.want_present_timing)
+    query_present_timing_caps(dev, ci.surface);
+
+  // Add the present-timing create flag so the swapchain records timing.
+  bool timing_flag = false;
+  if (g_cfg.mode == Mode::ScanlineSync && dev->present_timing_enabled &&
+      dev->caps_present_timing) {
+    if (driver_crashes_present_timing(dev)) {
+      static bool warned = false;
+      if (!warned) {
+        log("present_timing: VK_EXT_present_timing create flag crashes RADV; "
+            "disabling timing feedback. Manual scanline pacing still active.");
+        warned = true;
+      }
+      dev->present_timing_enabled = false;
+    } else {
+      ci.flags |= VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT;
+      timing_flag = true;
+    }
+  }
+
+  VkResult res =
+      dev->CreateSwapchainKHR(device, &ci, pAllocator, pSwapchain);
+  if (res != VK_SUCCESS)
+    return res;
+
+  // Initialize swapchain state.
+  {
+    std::lock_guard<std::mutex> lk(dev->mutex);
+    SwapchainState &st = dev->swapchains[*pSwapchain];
+    st.width = ci.imageExtent.width;
+    st.height = ci.imageExtent.height;
+    st.present_mode = ci.presentMode;
+    st.immediate_active = (ci.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR);
+    st.scanline = g_cfg.scanline;
+    st.refresh_ns = static_cast<uint64_t>(g_cfg.fallback_refresh.count());
+    recompute_scanline_offset(st);
+
+    if (timing_flag) {
+      st.timing_enabled = true;
+      st.first_pixel_out_supported = dev->caps_first_pixel_out;
+      if (dev->SetSwapchainPresentTimingQueueSizeEXT) {
+        VkResult qr = dev->SetSwapchainPresentTimingQueueSizeEXT(
+            dev->device, *pSwapchain, 8);
+        if (qr != VK_SUCCESS)
+          log("present_timing: SetSwapchainPresentTimingQueueSizeEXT %d", qr);
+      }
+      // Try to read refresh immediately.
+      query_refresh(dev, *pSwapchain, st);
+      recompute_scanline_offset(st);
+      // Resolve a valid time-domain id up front. Without this the present-time
+      // VkPresentTimingInfoEXT.timeDomainId would be 0 and crash the driver.
+      query_time_domains(dev, *pSwapchain, st);
+      st.feedback_active =
+          dev->caps_first_pixel_out && dev->GetPastPresentationTimingEXT != nullptr
+          && st.domain_known;
+      if (st.vrr_like)
+        log("scanline: VRR-like refresh reported (refreshInterval!=Duration)");
+    }
+    log("swapchain created %ux%u mode=%u immediate=%d timing=%d feedback=%d",
+        st.width, st.height, static_cast<unsigned>(st.present_mode),
+        st.immediate_active ? 1 : 0, st.timing_enabled ? 1 : 0,
+        st.feedback_active ? 1 : 0);
+  }
+  return res;
 }
 
-VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(
-    VkDevice device,
-    const char* pName) {
+VK_LAYER_EXPORT void VKAPI_CALL
+vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain,
+                      const VkAllocationCallbacks *pAllocator) {
+  DeviceLayer *dev = get_device(device);
+  if (!dev || !dev->DestroySwapchainKHR)
+    return;
+  {
+    std::lock_guard<std::mutex> lk(dev->mutex);
+    dev->swapchains.erase(swapchain);
+  }
+  if (dev->DestroySwapchainKHR)
+    dev->DestroySwapchainKHR(device, swapchain, pAllocator);
+}
+
+// ---- Acquire ----
+
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+                      VkSemaphore semaphore, VkFence fence, uint32_t *pImageIndex) {
+  DeviceLayer *dev = get_device(device);
+  if (dev) {
+    if (g_cfg.mode == Mode::ScanlineSync)
+      scanline_acquire_pace(dev, swapchain);
+    else if (g_cfg.mode == Mode::FpsLimit)
+      fps_acquire_pace(dev, swapchain);
+  }
+  VkResult res = dev && dev->AcquireNextImageKHR
+                     ? dev->AcquireNextImageKHR(device, swapchain, timeout,
+                                                semaphore, fence, pImageIndex)
+                     : VK_ERROR_INITIALIZATION_FAILED;
+  if (dev)
+    scanline_record_acquire(dev, swapchain, res);
+  return res;
+}
+
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKHR *pInfo,
+                       uint32_t *pImageIndex) {
+  DeviceLayer *dev = get_device(device);
+  if (dev) {
+    if (g_cfg.mode == Mode::ScanlineSync)
+      scanline_acquire_pace(dev, pInfo->swapchain);
+    else if (g_cfg.mode == Mode::FpsLimit)
+      fps_acquire_pace(dev, pInfo->swapchain);
+  }
+  VkResult res = dev && dev->AcquireNextImage2KHR
+                     ? dev->AcquireNextImage2KHR(device, pInfo, pImageIndex)
+                     : VK_ERROR_INITIALIZATION_FAILED;
+  if (dev)
+    scanline_record_acquire(dev, pInfo->swapchain, res);
+  return res;
+}
+
+// ---- Present ----
+
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
+  DeviceLayer *dev = get_device_by_queue(queue);
+  if (!dev || !dev->QueuePresentKHR)
+    return VK_ERROR_INITIALIZATION_FAILED;
+
+  // Scanline: small final wait before present, then chain our timing request.
+  VkSwapchainKHR primary = (pPresentInfo && pPresentInfo->swapchainCount)
+                               ? pPresentInfo->pSwapchains[0]
+                               : VK_NULL_HANDLE;
+  Clock::time_point target{};
+  if (g_cfg.mode == Mode::ScanlineSync && primary != VK_NULL_HANDLE)
+    target = scanline_present_pace(dev, primary);
+
+  apply_hotkeys();
+
+  // Build a present-info copy with our pNext chain (presentId + stage query),
+  // without disturbing the app's existing chain.
+  VkPresentInfoKHR info = *pPresentInfo;
+  std::vector<uint64_t> our_ids;
+  std::vector<VkPresentTimingInfoEXT> tinfo;
+  VkPresentIdKHR pid{};
+  VkPresentTimingsInfoEXT timings{};
+  void *our_head = const_cast<void *>(pPresentInfo->pNext);
+
+  bool inject_pid = dev->present_id_enabled && g_cfg.mode == Mode::ScanlineSync;
+  bool inject_timing =
+      dev->present_timing_enabled && dev->caps_present_timing &&
+      dev->caps_first_pixel_out && g_cfg.mode == Mode::ScanlineSync;
+
+  // Resolve a valid time-domain id per swapchain. We can only safely chain
+  // VkPresentTimingInfoEXT when every swapchain in this present has a known
+  // domain id (timeDomainId is an opaque driver handle; 0 crashes RADV).
+  std::vector<uint64_t> domain_ids;
+  if (inject_timing && info.swapchainCount) {
+    domain_ids.resize(info.swapchainCount, 0);
+    std::lock_guard<std::mutex> lk(dev->mutex);
+    for (uint32_t i = 0; i < info.swapchainCount; i++) {
+      auto it = dev->swapchains.find(info.pSwapchains[i]);
+      if (it == dev->swapchains.end() || !it->second.feedback_active) {
+        inject_timing = false;
+        break;
+      }
+      domain_ids[i] = it->second.timing_domain_id;
+    }
+  }
+
+  if (inject_timing) {
+    timings.sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT;
+    // Per-swapchain timing request: ask for first-pixel-out feedback.
+    tinfo.resize(info.swapchainCount);
+    for (uint32_t i = 0; i < info.swapchainCount; i++) {
+      tinfo[i].sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT;
+      tinfo[i].flags = 0;
+      tinfo[i].targetTime = 0; // no scheduling; we self-pace by timing the call
+      tinfo[i].timeDomainId = domain_ids[i];
+      tinfo[i].presentStageQueries =
+          VK_PRESENT_STAGE_IMAGE_FIRST_PIXEL_OUT_BIT_EXT;
+      tinfo[i].targetTimeDomainPresentStage = 0;
+    }
+    timings.swapchainCount = info.swapchainCount;
+    timings.pTimingInfos = tinfo.data();
+    timings.pNext = our_head;
+    our_head = &timings;
+  }
+
+  if (inject_pid) {
+    pid.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR;
+    // Use the app's ids if it already supplied VkPresentIdKHR; else our own.
+    const auto *app_pid = static_cast<const VkPresentIdKHR *>(
+        find_in_chain(pPresentInfo->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR));
+    if (app_pid && app_pid->pPresentIds) {
+      // Record a pending entry keyed by the first id.
+      pid = *app_pid;
+    } else {
+      our_ids.resize(info.swapchainCount);
+      uint64_t base = 0;
+      {
+        std::lock_guard<std::mutex> lk(dev->mutex);
+        auto it = dev->swapchains.find(primary);
+        if (it != dev->swapchains.end()) {
+          base = it->second.next_present_id;
+          it->second.next_present_id += info.swapchainCount;
+        }
+      }
+      for (uint32_t i = 0; i < info.swapchainCount; i++)
+        our_ids[i] = base + i;
+      pid.swapchainCount = info.swapchainCount;
+      pid.pPresentIds = our_ids.data();
+      pid.pNext = our_head;
+      our_head = &pid;
+    }
+  }
+
+  info.pNext = our_head;
+
+  // Record the pending target for each swapchain (present call time + target).
+  if (inject_pid) {
+    std::lock_guard<std::mutex> lk(dev->mutex);
+    Clock::time_point call = Clock::now();
+    for (uint32_t i = 0; i < info.swapchainCount; i++) {
+      auto it = dev->swapchains.find(info.pSwapchains[i]);
+      if (it == dev->swapchains.end())
+        continue;
+      uint64_t id = pid.pPresentIds[i];
+      Clock::time_point tgt = (i == 0) ? target : it->second.next_acquire_target;
+      it->second.pending[id] = {call, tgt};
+    }
+  }
+
+  VkResult res = dev->QueuePresentKHR(queue, &info);
+
+  // Optionally wait for the present to complete (helps keep queue depth low).
+  if (dev->present_wait_enabled && dev->WaitForPresentKHR &&
+      inject_pid && res == VK_SUCCESS) {
+    dev->WaitForPresentKHR(dev->device, primary, pid.pPresentIds[0],
+                           50'000'000ULL);
+  }
+
+  return res;
+}
+
+// ---- Surface creation (Wayland key-input init) ----
+
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkCreateWaylandSurfaceKHR(VkInstance instance,
+                          const VkWaylandSurfaceCreateInfoKHR *pCreateInfo,
+                          const VkAllocationCallbacks *pAllocator,
+                          VkSurfaceKHR *pSurface) {
+  InstanceLayer *layer = get_instance(instance);
+  PFN_vkCreateWaylandSurfaceKHR fp = nullptr;
+  if (layer && layer->GetInstanceProcAddr)
+    fp = reinterpret_cast<PFN_vkCreateWaylandSurfaceKHR>(
+        layer->GetInstanceProcAddr(instance, "vkCreateWaylandSurfaceKHR"));
+  if (!fp)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  VkResult res = fp(instance, pCreateInfo, pAllocator, pSurface);
+  if (res == VK_SUCCESS && pCreateInfo && pCreateInfo->display) {
+    vfc::key_input::init_wayland_display(pCreateInfo->display,
+                                         pCreateInfo->surface);
+  }
+  return res;
+}
+
+VK_LAYER_EXPORT void VKAPI_CALL
+vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface,
+                    const VkAllocationCallbacks *pAllocator) {
+  InstanceLayer *layer = get_instance(instance);
+  if (layer && layer->DestroySurfaceKHR)
+    layer->DestroySurfaceKHR(instance, surface, pAllocator);
+  // We don't track Wayland surface->wl_surface mapping for unref here; the
+  // key_input display is ref-counted by create and torn down at instance loss.
+}
+
+// =============================================================================
+// Section 10 — proc-addr resolution & layer negotiation
+// =============================================================================
+
+#define NAME_EQ(x) (std::strcmp(pName, x) == 0)
+
+VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL
+vkGetDeviceProcAddr(VkDevice device, const char *pName) {
   if (!pName)
     return nullptr;
+  if (NAME_EQ("vkGetDeviceProcAddr"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
+  if (NAME_EQ("vkCreateSwapchainKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkCreateSwapchainKHR);
+  if (NAME_EQ("vkDestroySwapchainKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkDestroySwapchainKHR);
+  if (NAME_EQ("vkAcquireNextImageKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImageKHR);
+  if (NAME_EQ("vkAcquireNextImage2KHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImage2KHR);
+  if (NAME_EQ("vkQueuePresentKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkQueuePresentKHR);
+  if (NAME_EQ("vkGetDeviceQueue"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue);
+  if (NAME_EQ("vkGetDeviceQueue2"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue2);
 
-  if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
-  if (std::strcmp(pName, "vkDestroyDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDevice);
-  if (std::strcmp(pName, "vkGetDeviceQueue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue);
-  if (std::strcmp(pName, "vkGetDeviceQueue2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue2);
-  if (std::strcmp(pName, "vkQueuePresentKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkQueuePresentKHR);
-  if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImageKHR);
-  if (std::strcmp(pName, "vkAcquireNextImage2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImage2KHR);
-  if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkCreateSwapchainKHR);
-  if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkDestroySwapchainKHR);
-
-  DeviceDispatch* dev = get_device_dispatch(device);
+  DeviceLayer *dev = get_device(device);
   if (dev && dev->GetDeviceProcAddr)
     return dev->GetDeviceProcAddr(device, pName);
-
   return nullptr;
 }
 
-VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(
-    VkInstance instance,
-    const char* pName) {
+VK_LAYER_EXPORT PFN_vkVoidFunction VKAPI_CALL
+vkGetInstanceProcAddr(VkInstance instance, const char *pName) {
   if (!pName)
     return nullptr;
+  if (NAME_EQ("vkGetInstanceProcAddr"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetInstanceProcAddr);
+  if (NAME_EQ("vkGetDeviceProcAddr"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
+  if (NAME_EQ("vkCreateInstance"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkCreateInstance);
+  if (NAME_EQ("vkDestroyInstance"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkDestroyInstance);
+  if (NAME_EQ("vkEnumeratePhysicalDevices"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkEnumeratePhysicalDevices);
+  if (NAME_EQ("vkCreateDevice"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkCreateDevice);
+  if (NAME_EQ("vkDestroyDevice"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDevice);
+  if (NAME_EQ("vkCreateWaylandSurfaceKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkCreateWaylandSurfaceKHR);
+  if (NAME_EQ("vkDestroySurfaceKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkDestroySurfaceKHR);
+  // Device-level hooks also queryable via instance gpa:
+  if (NAME_EQ("vkCreateSwapchainKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkCreateSwapchainKHR);
+  if (NAME_EQ("vkDestroySwapchainKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkDestroySwapchainKHR);
+  if (NAME_EQ("vkAcquireNextImageKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImageKHR);
+  if (NAME_EQ("vkAcquireNextImage2KHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImage2KHR);
+  if (NAME_EQ("vkQueuePresentKHR"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkQueuePresentKHR);
+  if (NAME_EQ("vkGetDeviceQueue"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue);
+  if (NAME_EQ("vkGetDeviceQueue2"))
+    return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue2);
 
-  if (std::strcmp(pName, "vkNegotiateLoaderLayerInterfaceVersion") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkNegotiateLoaderLayerInterfaceVersion);
-  if (std::strcmp(pName, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetInstanceProcAddr);
-  if (std::strcmp(pName, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
-  if (std::strcmp(pName, "vkCreateInstance") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkCreateInstance);
-  if (std::strcmp(pName, "vkDestroyInstance") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkDestroyInstance);
-  if (std::strcmp(pName, "vkEnumeratePhysicalDevices") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkEnumeratePhysicalDevices);
-  if (std::strcmp(pName, "vkCreateDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkCreateDevice);
-  if (std::strcmp(pName, "vkDestroyDevice") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkDestroyDevice);
-  if (std::strcmp(pName, "vkGetDeviceQueue") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue);
-  if (std::strcmp(pName, "vkGetDeviceQueue2") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceQueue2);
-  if (std::strcmp(pName, "vkQueuePresentKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkQueuePresentKHR);
-  if (std::strcmp(pName, "vkAcquireNextImageKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImageKHR);
-  if (std::strcmp(pName, "vkAcquireNextImage2KHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkAcquireNextImage2KHR);
-  if (std::strcmp(pName, "vkCreateSwapchainKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkCreateSwapchainKHR);
-  if (std::strcmp(pName, "vkDestroySwapchainKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkDestroySwapchainKHR);
-  if (std::strcmp(pName, "vkCreateWaylandSurfaceKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkCreateWaylandSurfaceKHR);
-  if (std::strcmp(pName, "vkDestroySurfaceKHR") == 0) return reinterpret_cast<PFN_vkVoidFunction>(vkDestroySurfaceKHR);
-
-  std::lock_guard<std::mutex> lock(g_mutex);
-  auto it = g_instances.find(instance);
-  if (it != g_instances.end() && it->second.GetInstanceProcAddr)
-    return it->second.GetInstanceProcAddr(instance, pName);
-
+  InstanceLayer *layer = get_instance(instance);
+  if (layer && layer->GetInstanceProcAddr)
+    return layer->GetInstanceProcAddr(instance, pName);
   return nullptr;
 }
 
-} // extern C
+VK_LAYER_EXPORT VkResult VKAPI_CALL
+vkNegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *pVersionStruct) {
+  if (!pVersionStruct || pVersionStruct->loaderLayerInterfaceVersion < 1)
+    return VK_ERROR_INITIALIZATION_FAILED;
+  pVersionStruct->loaderLayerInterfaceVersion = 2;
+  pVersionStruct->pfnGetInstanceProcAddr = vkGetInstanceProcAddr;
+  pVersionStruct->pfnGetDeviceProcAddr = vkGetDeviceProcAddr;
+  // pfnGetPhysicalDeviceProcAddr is optional; leave null.
+  return VK_SUCCESS;
+}
+
+} // extern "C"

@@ -21,7 +21,7 @@ cat > "$LAYER_DIR/VK_LAYER_MEIN_frame_capper.json" <<EOF_JSON
     "library_path": "$LIB_DIR/libVulkanFrameCapper.so",
     "api_version": "1.4.0",
     "implementation_version": "1",
-    "description": "Experimental Vulkan FPS capper using a DXVK-style late limiter",
+    "description": "Vulkan frame pacer + scanline sync layer",
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
     },

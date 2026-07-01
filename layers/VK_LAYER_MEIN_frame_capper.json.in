@@ -6,7 +6,7 @@
     "library_path": "@VFC_LIBRARY_PATH@",
     "api_version": "1.4.0",
     "implementation_version": "1",
-    "description": "Experimental Vulkan FPS capper using a DXVK-style late limiter",
+    "description": "Vulkan frame pacer + scanline sync layer",
     "functions": {
       "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion"
     },
