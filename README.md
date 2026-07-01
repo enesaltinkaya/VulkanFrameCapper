@@ -93,12 +93,14 @@ Uninstall:
   depth low). Default: `1` when a mode is active.
 
 Present-timing feedback (`VK_EXT_present_timing` + `calibrated_timestamps` +
-`get_surface_capabilities2`) is **attempted by default** in scanline mode — no
-env var needed. **Known driver bug:** on RADV (Mesa AMD) the `VK_EXT_present_timing`
-swapchain create flag segfaults the driver inside `vkQueuePresentKHR`. The layer
-detects RADV and automatically disables feedback (falling back to manual scanline
-pacing) rather than crashing — you'll see a log line saying so. On non-RADV
-drivers (e.g. NVIDIA proprietary) the PLL auto-lock engages.
+`get_surface_capabilities2`) is **attempted by default** in scanline mode. Set
+`VFC_PRESENT_TIMING=0` to disable it and use manual scanline pacing. **Known
+driver bug:** on RADV (Mesa AMD) the `VK_EXT_present_timing` swapchain create
+flag segfaults the driver inside `vkQueuePresentKHR`. The layer detects RADV and
+automatically disables feedback (falling back to manual scanline pacing) rather
+than crashing — you'll see a log line saying so. On non-RADV drivers (e.g. NVIDIA
+proprietary) the PLL auto-lock engages when the driver exposes the needed
+features.
 
 - `VFC_FORCE_IMMEDIATE=1` — (scanline mode) force
   `VK_PRESENT_MODE_IMMEDIATE_KHR` when available. Default: `1`. Set `0` to keep

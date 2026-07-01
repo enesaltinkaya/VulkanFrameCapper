@@ -174,9 +174,10 @@ Config parse_config() {
   // at launch. Manual scanline pacing (phase model + manual offset) works
   // without it.
   // present_timing feedback defaults to ON in scanline mode. The layer
-  // auto-disables it where the driver's create flag crashes (RADV), so it's
-  // safe to attempt unconditionally.
-  c.want_present_timing = c.mode == Mode::ScanlineSync;
+  // auto-disables it where the driver's create flag crashes (RADV), and it can
+  // be disabled manually for driver bring-up/debugging.
+  c.want_present_timing = env_bool("VFC_PRESENT_TIMING",
+                                   c.mode == Mode::ScanlineSync);
   c.want_present_wait = env_bool("VFC_PRESENT_WAIT",
                                  c.mode != Mode::Off);
 
@@ -1300,6 +1301,7 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
 
   // Query feature support before enabling feature structs.
   bool feat_pid = false, feat_pwait = false, feat_ptiming = false;
+  bool feat_ptiming_abs_time = false;
   if (inst && inst->GetPhysicalDeviceFeatures2) {
     VkPhysicalDevicePresentIdFeaturesKHR f_pid{};
     f_pid.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR;
@@ -1316,11 +1318,13 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
     feat_pid = have_pid && f_pid.presentId;
     feat_pwait = have_pwait && f_pwait.presentWait;
     feat_ptiming = have_ptiming && f_ptiming.presentTiming;
+    feat_ptiming_abs_time = have_ptiming && f_ptiming.presentAtAbsoluteTime;
   } else {
     // No Features2: assume supported if the extension is present.
     feat_pid = have_pid;
     feat_pwait = have_pwait;
     feat_ptiming = have_ptiming;
+    feat_ptiming_abs_time = false;
   }
 
   // Build a new extension list.
@@ -1340,7 +1344,7 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
   add_ext(feat_pid, VK_KHR_PRESENT_ID_EXTENSION_NAME);
   add_ext(feat_pwait, VK_KHR_PRESENT_WAIT_EXTENSION_NAME);
   add_ext(feat_ptiming, VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
-  add_ext(have_calib, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+  add_ext(feat_ptiming && have_calib, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 
   // Build a feature pNext chain to enable them.
   VkPhysicalDevicePresentIdFeaturesKHR en_pid{};
@@ -1353,7 +1357,11 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
   void *feat_head = const_cast<void *>(pCreateInfo->pNext);
   if (feat_ptiming) {
     en_ptiming.presentTiming = VK_TRUE;
-    en_ptiming.presentAtAbsoluteTime = VK_TRUE;
+    // We self-pace and pass targetTime=0, so absolute-time scheduling is not
+    // required. Some drivers expose presentTiming without this optional bit;
+    // requesting it there makes vkCreateDevice fail with
+    // VK_ERROR_FEATURE_NOT_PRESENT (observed on NVIDIA).
+    en_ptiming.presentAtAbsoluteTime = feat_ptiming_abs_time ? VK_TRUE : VK_FALSE;
     en_ptiming.pNext = feat_head;
     feat_head = &en_ptiming;
   }
@@ -1378,8 +1386,28 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
 
   VkResult res = chain_create(physicalDevice, &ci, pAllocator, pDevice);
   if (res != VK_SUCCESS) {
-    delete dev;
-    return res;
+    log("vkCreateDevice with helper extensions failed: %d; retrying without them", res);
+
+    // If a driver rejects one of the helper extensions/features we enable for
+    // scanline feedback, do not make device creation fail. Retry the app's
+    // original create-info and keep manual pacing active (no present-id/wait or
+    // present-timing injection). Reset the loader link because downstream layers
+    // may have advanced it during the failed attempt.
+    link->u.pLayerInfo = layer_link->pNext;
+    VkDeviceCreateInfo fallback_ci = *pCreateInfo;
+    res = chain_create(physicalDevice, &fallback_ci, pAllocator, pDevice);
+    if (res != VK_SUCCESS) {
+      log("vkCreateDevice fallback failed: %d", res);
+      delete dev;
+      return res;
+    }
+
+    feat_pid = false;
+    feat_pwait = false;
+    feat_ptiming = false;
+    feat_ptiming_abs_time = false;
+    have_calib = false;
+    log("vkCreateDevice fallback succeeded; scanline feedback disabled");
   }
 
   dev->device = *pDevice;
@@ -1430,9 +1458,9 @@ vkCreateDevice(VkPhysicalDevice physicalDevice,
     std::lock_guard<std::mutex> lk(g_device_mutex);
     g_devices[dev->device] = dev;
   }
-  log("device created; pid=%d pwait=%d ptiming=%d calib=%d",
+  log("device created; pid=%d pwait=%d ptiming=%d ptiming_abs=%d calib=%d",
       feat_pid ? 1 : 0, feat_pwait ? 1 : 0, feat_ptiming ? 1 : 0,
-      have_calib ? 1 : 0);
+      feat_ptiming_abs_time ? 1 : 0, (feat_ptiming && have_calib) ? 1 : 0);
   return res;
 }
 
