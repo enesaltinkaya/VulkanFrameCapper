@@ -37,7 +37,7 @@ VK_INSTANCE_LAYERS=VK_LAYER_MEIN_frame_capper \
 vkcube
 ```
 
-The build-tree manifest uses a *relative* `library_path`, so on some loader
+The build-tree manifest uses a _relative_ `library_path`, so on some loader
 setups you may get `Requested layer ... was wrong bit-type`. If that happens,
 either install as an implicit layer (below) or point `VK_LAYER_PATH` at a
 directory whose manifest uses an absolute `library_path`.
@@ -145,8 +145,8 @@ Active in both modes. X11 and Wayland are supported. Hotkeys fire once when the 
 
 - **FPS mode:** `Shift + Plus/Minus` steps the cap by `0.01`;
   `Ctrl + Plus/Minus` steps by `0.10`.
-- **Scanline mode:** `Shift + Plus/Minus` steps the phase offset by `1 ms`;
-  `Ctrl + Plus/Minus` steps by `0.1 ms`.
+- **Scanline mode:** `Ctrl + Plus/Minus` moves the tearline target by `10` scanlines;
+  `Shift + Plus/Minus` steps the phase offset by `1 ms`.
 
 ## Scanline mode — how it works
 
@@ -187,8 +187,8 @@ Behavior:
 This requires fullscreen / direct-scanout / tearing support (e.g. Plasma
 Wayland "allow tearing in fullscreen") to produce a stable visible tearline.
 Without present-timing feedback, `SCANLINE` is manually tunable rather than
-physically absolute; nudge `VFC_SCANLINE_OFFSET_US` (or the hotkeys) if the
-tearline is consistently shifted.
+physically absolute; nudge `VFC_SCANLINE_OFFSET_US` (or `Shift + Plus/Minus`) if
+the tearline is consistently shifted.
 
 ## Notes
 

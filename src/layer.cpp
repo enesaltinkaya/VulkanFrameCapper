@@ -199,7 +199,8 @@ Config g_cfg = parse_config();
 
 // Live FPS cap (adjustable via hotkeys). Inactive in scanline mode.
 std::atomic<double> g_live_fps{g_cfg.mode == Mode::FpsLimit ? g_cfg.target_fps : 0.0};
-// Live scanline offset calibration (adjustable via hotkeys).
+// Live scanline target and offset calibration (adjustable via hotkeys).
+std::atomic<int64_t> g_live_scanline{g_cfg.scanline};
 std::atomic<int64_t> g_live_offset_ns{g_cfg.manual_offset.count()};
 
 // =============================================================================
@@ -715,6 +716,11 @@ void recompute_scanline_offset(SwapchainState &st) {
   st.scanline_offset_ns = Ns(wrap_period(off, refresh));
 }
 
+void sync_live_scanline(SwapchainState &st) {
+  st.scanline = g_live_scanline.load(std::memory_order_relaxed);
+  recompute_scanline_offset(st);
+}
+
 // The desired first-pixel-out time for THIS frame. Each call advances the
 // phase anchor by exactly one refresh (one frame per refresh, like RTSS), and
 // skips forward only when a slot was missed because rendering fell behind.
@@ -761,12 +767,9 @@ void scanline_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
   // Lazily re-query refresh; some drivers only populate it after warmup.
   if (dev->present_timing_enabled && !st.refresh_measured)
     query_refresh(dev, sw, st);
-  if (!st.refresh_measured) {
+  if (!st.refresh_measured)
     st.refresh_ns = static_cast<uint64_t>(g_cfg.fallback_refresh.count());
-    recompute_scanline_offset(st);
-  } else {
-    recompute_scanline_offset(st);
-  }
+  sync_live_scanline(st);
 
   if (g_cfg.disable_when_vrr && st.vrr_like) {
     static bool warned = false;
@@ -776,7 +779,7 @@ void scanline_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
     }
   }
 
-  // Hotkey offset adjustment.
+  // Hotkey adjustment.
   apply_hotkeys();
 
   auto now = Clock::now();
@@ -820,8 +823,10 @@ Clock::time_point scanline_present_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
   auto now = Clock::now();
   Clock::time_point target = st.next_acquire_target; // set during acquire pace
   // If acquire pacing was skipped (e.g. first frame), compute it now.
-  if (target == Clock::time_point())
+  if (target == Clock::time_point()) {
+    sync_live_scanline(st);
     target = scanline_target(st, now);
+  }
 
   Ns live_offset = Ns(g_live_offset_ns.load(std::memory_order_relaxed));
   Clock::time_point desired_present_call = target - st.present_latency + live_offset;
@@ -912,7 +917,8 @@ void fps_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
 // Section 7 — hotkeys
 //
 // FPS mode: Shift+/- steps 0.01, Ctrl+/- steps 0.10.
-// Scanline mode: Shift+/- steps the phase offset by 1ms, Ctrl+/- by 0.1ms.
+// Scanline mode: Shift+/- steps the phase offset by 1ms,
+//                Ctrl+/- moves the tearline target by 10 scanlines.
 // =============================================================================
 
 enum class HotkeyCombo {
@@ -966,28 +972,32 @@ void apply_hotkey_action(HotkeyCombo combo) {
     g_live_fps.store(f, std::memory_order_relaxed);
     log("fps cap -> %.2f", f);
   } else if (g_cfg.mode == Mode::ScanlineSync) {
-    int64_t off = g_live_offset_ns.load(std::memory_order_relaxed);
-    constexpr int64_t coarse = 1'000'000; // 1 ms
-    constexpr int64_t fine = 100'000;     // 0.1 ms
-    switch (combo) {
-    case HotkeyCombo::IncreaseSlow:
-      off += coarse;
-      break;
-    case HotkeyCombo::DecreaseSlow:
-      off -= coarse;
-      break;
-    case HotkeyCombo::IncreaseFast:
-      off += fine;
-      break;
-    case HotkeyCombo::DecreaseFast:
-      off -= fine;
-      break;
-    case HotkeyCombo::NoCombo:
-      break;
+    if (combo == HotkeyCombo::IncreaseFast || combo == HotkeyCombo::DecreaseFast) {
+      int64_t scanline = g_live_scanline.load(std::memory_order_relaxed);
+      constexpr int64_t line_step = 100;
+      scanline += (combo == HotkeyCombo::IncreaseFast) ? line_step : -line_step;
+      scanline = std::clamp<int64_t>(scanline, -1'000'000LL, 1'000'000LL);
+      g_live_scanline.store(scanline, std::memory_order_relaxed);
+      log("scanline target -> %+lld", static_cast<long long>(scanline));
+    } else {
+      int64_t off = g_live_offset_ns.load(std::memory_order_relaxed);
+      constexpr int64_t coarse = 1'000'000; // 1 ms
+      switch (combo) {
+      case HotkeyCombo::IncreaseSlow:
+        off += coarse;
+        break;
+      case HotkeyCombo::DecreaseSlow:
+        off -= coarse;
+        break;
+      case HotkeyCombo::IncreaseFast:
+      case HotkeyCombo::DecreaseFast:
+      case HotkeyCombo::NoCombo:
+        break;
+      }
+      off = std::clamp<int64_t>(off, -1'000'000'000LL, 1'000'000'000LL);
+      g_live_offset_ns.store(off, std::memory_order_relaxed);
+      log("scanline offset -> %+lld us", static_cast<long long>(off / 1000));
     }
-    off = std::clamp<int64_t>(off, -1'000'000'000LL, 1'000'000'000LL);
-    g_live_offset_ns.store(off, std::memory_order_relaxed);
-    log("scanline offset -> %+lld us", static_cast<long long>(off / 1000));
   }
 }
 
@@ -1564,7 +1574,7 @@ vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *pCreateInf
     st.height = ci.imageExtent.height;
     st.present_mode = ci.presentMode;
     st.immediate_active = (ci.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR);
-    st.scanline = g_cfg.scanline;
+    st.scanline = g_live_scanline.load(std::memory_order_relaxed);
     st.refresh_ns = static_cast<uint64_t>(g_cfg.fallback_refresh.count());
     recompute_scanline_offset(st);
 
