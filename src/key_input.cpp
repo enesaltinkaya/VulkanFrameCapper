@@ -121,6 +121,15 @@ bool x11_decrease_fast_pressed() {
   return x11_ctrl_pressed(keys) && x11_minus_pressed(keys);
 }
 
+bool x11_toggle_limit_pressed() {
+  if (!init_x11())
+    return false;
+
+  char keys[32] = {};
+  XQueryKeymap(g_x11_display, keys);
+  return x11_shift_pressed(keys) && x11_keysym_pressed(keys, XK_F9);
+}
+
 // --------------------------- Wayland ---------------------------
 
 struct WaylandDisplay {
@@ -372,6 +381,18 @@ bool wayland_decrease_fast_pressed() {
   return false;
 }
 
+bool wayland_toggle_limit_pressed() {
+  std::lock_guard<std::mutex> lock(g_wayland_mutex);
+  update_wayland_queues_locked();
+
+  for (const auto& [_, wd] : g_wayland_displays) {
+    if (wayland_shift_pressed(wd) && wayland_keysym_pressed(wd, XKB_KEY_F9))
+      return true;
+  }
+
+  return false;
+}
+
 bool wayland_has_displays() {
   std::lock_guard<std::mutex> lock(g_wayland_mutex);
   return !g_wayland_displays.empty();
@@ -449,6 +470,10 @@ bool increase_fast_pressed() {
 
 bool decrease_fast_pressed() {
   return wayland_has_displays() ? wayland_decrease_fast_pressed() : x11_decrease_fast_pressed();
+}
+
+bool toggle_limit_pressed() {
+  return wayland_has_displays() ? wayland_toggle_limit_pressed() : x11_toggle_limit_pressed();
 }
 
 } // namespace vfc::key_input

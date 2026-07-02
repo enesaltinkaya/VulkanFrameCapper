@@ -148,7 +148,7 @@ struct Config {
 
 Config parse_config() {
   Config c;
-  c.log = env_bool("VFC_LOG", false);
+  c.log = env_bool("VFC_LOG", true);
 
   int64_t scanline = env_int("SCANLINE", 0);
   const char *sv = std::getenv("SCANLINE");
@@ -198,6 +198,10 @@ Config parse_config() {
 
 Config g_cfg = parse_config();
 
+// Hotkey-toggleable global pacing gate. When off, FPS and scanline pacing are
+// bypassed while the configured targets remain intact for re-enabling.
+std::atomic<bool> g_cap_enabled{g_cfg.mode != Mode::Off};
+std::atomic<uint64_t> g_cap_generation{0};
 // Live FPS cap (adjustable via hotkeys). Inactive in scanline mode.
 std::atomic<double> g_live_fps{g_cfg.mode == Mode::FpsLimit ? g_cfg.target_fps : 0.0};
 // Live scanline target and offset calibration (adjustable via hotkeys).
@@ -295,6 +299,9 @@ struct SwapchainState {
   Ns fps_period = Ns::zero();
   Clock::time_point next_frame_start{};
   bool fps_seeded = false;
+
+  // pacing hotkey generation seen by this swapchain (used to reset stale state)
+  uint64_t cap_generation_seen = 0;
 
   // present-timing feedback
   bool timing_enabled = false;        // create flag set on swapchain
@@ -740,9 +747,12 @@ Clock::time_point scanline_target(SwapchainState &st, Clock::time_point now) {
   // drop whole refreshes from tiny scheduler/render-lead jitter. It is smoother
   // to keep the current slot if the target itself is still ahead; the final
   // present-side wait can still hit the desired phase.
-  while (target <= now) {
-    st.phase_base += Ns(refresh);
-    target += Ns(refresh);
+  if (target <= now) {
+    int64_t behind = std::chrono::duration_cast<Ns>(now - target).count();
+    int64_t periods = behind / refresh + 1;
+    Ns advance(refresh * periods);
+    st.phase_base += advance;
+    target += advance;
   }
   // Consume this slot: advance the anchor by one refresh so the next frame
   // targets the next refresh. Without this, multiple frames would pile onto
@@ -755,15 +765,40 @@ Clock::time_point scanline_target(SwapchainState &st, Clock::time_point now) {
 // pacing loop polls it here.
 void apply_hotkeys();
 
+bool cap_enabled() {
+  return g_cap_enabled.load();
+}
+
+void sync_cap_generation(SwapchainState &st) {
+  uint64_t gen = g_cap_generation.load();
+  if (st.cap_generation_seen == gen)
+    return;
+
+  st.cap_generation_seen = gen;
+  st.next_acquire_target = Clock::time_point();
+  st.last_acquire_wake = Clock::time_point();
+  st.acquire_seeded = false;
+  st.fps_period = Ns::zero();
+  st.next_frame_start = Clock::time_point();
+  st.fps_seeded = false;
+  st.pending.clear();
+}
+
 // Mode 2 — pace the frame start at acquire for low input lag.
 void scanline_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
   if (g_cfg.mode != Mode::ScanlineSync)
     return;
+
+  apply_hotkeys();
+
   std::lock_guard<std::mutex> lk(dev->mutex);
   auto it = dev->swapchains.find(sw);
   if (it == dev->swapchains.end())
     return;
   SwapchainState &st = it->second;
+  sync_cap_generation(st);
+  if (!cap_enabled())
+    return;
 
   // Lazily re-query refresh; some drivers only populate it after warmup.
   if (dev->present_timing_enabled && !st.refresh_measured)
@@ -779,9 +814,6 @@ void scanline_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
       warned = true;
     }
   }
-
-  // Hotkey adjustment.
-  apply_hotkeys();
 
   auto now = Clock::now();
   Clock::time_point target = scanline_target(st, now);
@@ -799,7 +831,7 @@ void scanline_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
 }
 
 void scanline_record_acquire(DeviceLayer *dev, VkSwapchainKHR sw, VkResult res) {
-  if (g_cfg.mode != Mode::ScanlineSync)
+  if (g_cfg.mode != Mode::ScanlineSync || !cap_enabled())
     return;
   if (res != VK_SUCCESS && res != VK_SUBOPTIMAL_KHR)
     return;
@@ -818,6 +850,9 @@ Clock::time_point scanline_present_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
   if (it == dev->swapchains.end())
     return Clock::time_point();
   SwapchainState &st = it->second;
+  sync_cap_generation(st);
+  if (!cap_enabled())
+    return Clock::time_point();
 
   poll_feedback(dev, sw, st);
 
@@ -883,16 +918,21 @@ Clock::time_point scanline_present_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
 void fps_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
   if (g_cfg.mode != Mode::FpsLimit)
     return;
-  double fps = g_live_fps.load(std::memory_order_relaxed);
-  if (fps <= 0.0)
-    return;
+
+  apply_hotkeys();
+
   std::lock_guard<std::mutex> lk(dev->mutex);
   auto it = dev->swapchains.find(sw);
   if (it == dev->swapchains.end())
     return;
   SwapchainState &st = it->second;
+  sync_cap_generation(st);
+  if (!cap_enabled())
+    return;
 
-  apply_hotkeys();
+  double fps = g_live_fps.load(std::memory_order_relaxed);
+  if (fps <= 0.0)
+    return;
 
   if (st.fps_period.count() == 0)
     st.fps_period = Ns(static_cast<int64_t>(1e9 / fps));
@@ -917,6 +957,7 @@ void fps_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
 // =============================================================================
 // Section 7 — hotkeys
 //
+// Shift+F9 toggles pacing on/off in both modes.
 // FPS mode: Shift+/- steps 0.01, Ctrl+/- steps 0.10.
 // Scanline mode: Shift+/- steps the phase offset by 1ms,
 //                Ctrl+/- moves the tearline target by 10 scanlines.
@@ -928,6 +969,7 @@ enum class HotkeyCombo {
   DecreaseSlow,
   IncreaseFast,
   DecreaseFast,
+  ToggleLimit,
 };
 
 std::mutex g_hotkey_mutex;
@@ -935,6 +977,8 @@ Clock::time_point g_last_hotkey_check;
 HotkeyCombo g_held_hotkey = HotkeyCombo::NoCombo;
 
 HotkeyCombo poll_hotkey_combo() {
+  if (vfc::key_input::toggle_limit_pressed())
+    return HotkeyCombo::ToggleLimit;
   // Ctrl combos first, so Ctrl+Shift+Plus still means the fast action.
   if (vfc::key_input::increase_fast_pressed())
     return HotkeyCombo::IncreaseFast;
@@ -950,6 +994,16 @@ HotkeyCombo poll_hotkey_combo() {
 void apply_hotkey_action(HotkeyCombo combo) {
   if (combo == HotkeyCombo::NoCombo)
     return;
+
+  if (combo == HotkeyCombo::ToggleLimit) {
+    if (g_cfg.mode == Mode::Off)
+      return;
+    bool enabled = !g_cap_enabled.load();
+    g_cap_generation.fetch_add(1);
+    g_cap_enabled.store(enabled);
+    log("fps limit -> %s", enabled ? "on" : "off");
+    return;
+  }
 
   if (g_cfg.mode == Mode::FpsLimit) {
     double f = g_live_fps.load(std::memory_order_relaxed);
@@ -967,6 +1021,7 @@ void apply_hotkey_action(HotkeyCombo combo) {
       f -= 0.10;
       break;
     case HotkeyCombo::NoCombo:
+    case HotkeyCombo::ToggleLimit:
       break;
     }
     f = std::clamp(f, 1.0, 1000.0);
@@ -993,6 +1048,7 @@ void apply_hotkey_action(HotkeyCombo combo) {
       case HotkeyCombo::IncreaseFast:
       case HotkeyCombo::DecreaseFast:
       case HotkeyCombo::NoCombo:
+      case HotkeyCombo::ToggleLimit:
         break;
       }
       off = std::clamp<int64_t>(off, -1'000'000'000LL, 1'000'000'000LL);
@@ -1696,15 +1752,16 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
   if (!dev || !dev->QueuePresentKHR)
     return VK_ERROR_INITIALIZATION_FAILED;
 
+  apply_hotkeys();
+
   // Scanline: small final wait before present, then chain our timing request.
   VkSwapchainKHR primary = (pPresentInfo && pPresentInfo->swapchainCount)
                                ? pPresentInfo->pSwapchains[0]
                                : VK_NULL_HANDLE;
+  bool scanline_cap_active = g_cfg.mode == Mode::ScanlineSync && cap_enabled();
   Clock::time_point target{};
-  if (g_cfg.mode == Mode::ScanlineSync && primary != VK_NULL_HANDLE)
+  if (scanline_cap_active && primary != VK_NULL_HANDLE)
     target = scanline_present_pace(dev, primary);
-
-  apply_hotkeys();
 
   // Build a present-info copy with our pNext chain (presentId + stage query),
   // without disturbing the app's existing chain.
@@ -1715,10 +1772,10 @@ vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *pPresentInfo) {
   VkPresentTimingsInfoEXT timings{};
   void *our_head = const_cast<void *>(pPresentInfo->pNext);
 
-  bool inject_pid = dev->present_id_enabled && g_cfg.mode == Mode::ScanlineSync;
+  bool inject_pid = dev->present_id_enabled && scanline_cap_active;
   bool inject_timing =
       dev->present_timing_enabled && dev->caps_present_timing &&
-      dev->caps_first_pixel_out && g_cfg.mode == Mode::ScanlineSync;
+      dev->caps_first_pixel_out && scanline_cap_active;
 
   // Resolve a valid time-domain id per swapchain. We can only safely chain
   // VkPresentTimingInfoEXT when every swapchain in this present has a known
