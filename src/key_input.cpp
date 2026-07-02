@@ -121,7 +121,7 @@ bool x11_decrease_fast_pressed() {
   return x11_ctrl_pressed(keys) && x11_minus_pressed(keys);
 }
 
-bool x11_toggle_limit_pressed() {
+bool x11_cycle_limit_pressed() {
   if (!init_x11())
     return false;
 
@@ -381,7 +381,7 @@ bool wayland_decrease_fast_pressed() {
   return false;
 }
 
-bool wayland_toggle_limit_pressed() {
+bool wayland_cycle_limit_pressed() {
   std::lock_guard<std::mutex> lock(g_wayland_mutex);
   update_wayland_queues_locked();
 
@@ -472,8 +472,8 @@ bool decrease_fast_pressed() {
   return wayland_has_displays() ? wayland_decrease_fast_pressed() : x11_decrease_fast_pressed();
 }
 
-bool toggle_limit_pressed() {
-  return wayland_has_displays() ? wayland_toggle_limit_pressed() : x11_toggle_limit_pressed();
+bool cycle_limit_pressed() {
+  return wayland_has_displays() ? wayland_cycle_limit_pressed() : x11_cycle_limit_pressed();
 }
 
 } // namespace vfc::key_input

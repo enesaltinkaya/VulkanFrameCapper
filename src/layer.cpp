@@ -198,11 +198,14 @@ Config parse_config() {
 
 Config g_cfg = parse_config();
 
-// Hotkey-toggleable global pacing gate. When off, FPS and scanline pacing are
+// Hotkey-controlled global pacing gate. When off, FPS and scanline pacing are
 // bypassed while the configured targets remain intact for re-enabling.
 std::atomic<bool> g_cap_enabled{g_cfg.mode != Mode::Off};
 std::atomic<uint64_t> g_cap_generation{0};
-// Live FPS cap (adjustable via hotkeys). Inactive in scanline mode.
+// Live FPS limit preset (adjustable via hotkeys). In FPS mode it is the direct
+// cap; in scanline mode it controls how many refresh slots are skipped. A value
+// of 0 means "use scanline's default refresh-rate pacing" while enabled, or
+// uncapped when g_cap_enabled is false.
 std::atomic<double> g_live_fps{g_cfg.mode == Mode::FpsLimit ? g_cfg.target_fps : 0.0};
 // Live scanline target and offset calibration (adjustable via hotkeys).
 std::atomic<int64_t> g_live_scanline{g_cfg.scanline};
@@ -289,6 +292,7 @@ struct SwapchainState {
   Ns present_latency = std::chrono::microseconds(2000); // call -> first-pixel-out
   Ns render_lead = std::chrono::milliseconds(3);        // acquire-wake -> present-call
   Ns scanline_offset_ns = Ns::zero();                   // computed from scanline value
+  double scanline_slot_accum = 0.0;                     // fractional FPS preset slots
 
   // acquire pacing
   Clock::time_point next_acquire_target{};
@@ -729,10 +733,30 @@ void sync_live_scanline(SwapchainState &st) {
   recompute_scanline_offset(st);
 }
 
+int64_t scanline_slots_to_advance(SwapchainState &st, int64_t refresh) {
+  double fps = g_live_fps.load(std::memory_order_relaxed);
+  if (fps <= 0.0 || !std::isnormal(fps)) {
+    st.scanline_slot_accum = 0.0;
+    return 1;
+  }
+
+  double slots = 1.0e9 / (fps * static_cast<double>(refresh));
+  if (slots <= 1.0) {
+    st.scanline_slot_accum = 0.0;
+    return 1;
+  }
+
+  st.scanline_slot_accum += slots;
+  int64_t whole = static_cast<int64_t>(std::floor(st.scanline_slot_accum));
+  whole = std::clamp<int64_t>(whole, 1, 1'000'000);
+  st.scanline_slot_accum -= static_cast<double>(whole);
+  return whole;
+}
+
 // The desired first-pixel-out time for THIS frame. Each call advances the
-// phase anchor by exactly one refresh (one frame per refresh, like RTSS), and
-// skips forward only when a slot was missed because rendering fell behind.
-// This is what caps the frame rate to the refresh rate with even spacing.
+// phase anchor by one or more refresh slots, and skips forward when rendering
+// fell behind. In scanline mode the FPS preset is implemented by skipping
+// integer refresh slots so the tearline stays at the requested scanline.
 Clock::time_point scanline_target(SwapchainState &st, Clock::time_point now) {
   int64_t refresh = st.refresh_ns ? static_cast<int64_t>(st.refresh_ns)
                                   : static_cast<int64_t>(g_cfg.fallback_refresh.count());
@@ -754,10 +778,9 @@ Clock::time_point scanline_target(SwapchainState &st, Clock::time_point now) {
     st.phase_base += advance;
     target += advance;
   }
-  // Consume this slot: advance the anchor by one refresh so the next frame
-  // targets the next refresh. Without this, multiple frames would pile onto
-  // the same slot and burst past the refresh rate.
-  st.phase_base += Ns(refresh);
+  // Consume this slot: advance the anchor by the live FPS preset. Without
+  // this, multiple frames would pile onto the same slot and burst past the cap.
+  st.phase_base += Ns(refresh * scanline_slots_to_advance(st, refresh));
   return target;
 }
 
@@ -778,6 +801,7 @@ void sync_cap_generation(SwapchainState &st) {
   st.next_acquire_target = Clock::time_point();
   st.last_acquire_wake = Clock::time_point();
   st.acquire_seeded = false;
+  st.scanline_slot_accum = 0.0;
   st.fps_period = Ns::zero();
   st.next_frame_start = Clock::time_point();
   st.fps_seeded = false;
@@ -957,7 +981,7 @@ void fps_acquire_pace(DeviceLayer *dev, VkSwapchainKHR sw) {
 // =============================================================================
 // Section 7 — hotkeys
 //
-// Shift+F9 toggles pacing on/off in both modes.
+// Shift+F9 cycles the limit presets: 120 -> 60 -> 0/off.
 // FPS mode: Shift+/- steps 0.01, Ctrl+/- steps 0.10.
 // Scanline mode: Shift+/- steps the phase offset by 1ms,
 //                Ctrl+/- moves the tearline target by 10 scanlines.
@@ -969,7 +993,7 @@ enum class HotkeyCombo {
   DecreaseSlow,
   IncreaseFast,
   DecreaseFast,
-  ToggleLimit,
+  CycleLimit,
 };
 
 std::mutex g_hotkey_mutex;
@@ -977,8 +1001,8 @@ Clock::time_point g_last_hotkey_check;
 HotkeyCombo g_held_hotkey = HotkeyCombo::NoCombo;
 
 HotkeyCombo poll_hotkey_combo() {
-  if (vfc::key_input::toggle_limit_pressed())
-    return HotkeyCombo::ToggleLimit;
+  if (vfc::key_input::cycle_limit_pressed())
+    return HotkeyCombo::CycleLimit;
   // Ctrl combos first, so Ctrl+Shift+Plus still means the fast action.
   if (vfc::key_input::increase_fast_pressed())
     return HotkeyCombo::IncreaseFast;
@@ -995,13 +1019,25 @@ void apply_hotkey_action(HotkeyCombo combo) {
   if (combo == HotkeyCombo::NoCombo)
     return;
 
-  if (combo == HotkeyCombo::ToggleLimit) {
+  if (combo == HotkeyCombo::CycleLimit) {
     if (g_cfg.mode == Mode::Off)
       return;
-    bool enabled = !g_cap_enabled.load();
+
+    bool enabled = g_cap_enabled.load();
+    double current = enabled ? g_live_fps.load(std::memory_order_relaxed) : 0.0;
+    double next = 120.0;
+    if (enabled && std::abs(current - 120.0) < 0.5)
+      next = 60.0;
+    else if (enabled && std::abs(current - 60.0) < 0.5)
+      next = 0.0;
+
+    g_live_fps.store(next, std::memory_order_relaxed);
+    g_cap_enabled.store(next > 0.0);
     g_cap_generation.fetch_add(1);
-    g_cap_enabled.store(enabled);
-    log("fps limit -> %s", enabled ? "on" : "off");
+    if (next > 0.0)
+      log("fps limit -> %.0f", next);
+    else
+      log("fps limit -> off");
     return;
   }
 
@@ -1021,7 +1057,7 @@ void apply_hotkey_action(HotkeyCombo combo) {
       f -= 0.10;
       break;
     case HotkeyCombo::NoCombo:
-    case HotkeyCombo::ToggleLimit:
+    case HotkeyCombo::CycleLimit:
       break;
     }
     f = std::clamp(f, 1.0, 1000.0);
@@ -1030,7 +1066,7 @@ void apply_hotkey_action(HotkeyCombo combo) {
   } else if (g_cfg.mode == Mode::ScanlineSync) {
     if (combo == HotkeyCombo::IncreaseFast || combo == HotkeyCombo::DecreaseFast) {
       int64_t scanline = g_live_scanline.load(std::memory_order_relaxed);
-      constexpr int64_t line_step = 100;
+      constexpr int64_t line_step = 300;
       scanline += (combo == HotkeyCombo::IncreaseFast) ? line_step : -line_step;
       scanline = std::clamp<int64_t>(scanline, -1'000'000LL, 1'000'000LL);
       g_live_scanline.store(scanline, std::memory_order_relaxed);
@@ -1048,7 +1084,7 @@ void apply_hotkey_action(HotkeyCombo combo) {
       case HotkeyCombo::IncreaseFast:
       case HotkeyCombo::DecreaseFast:
       case HotkeyCombo::NoCombo:
-      case HotkeyCombo::ToggleLimit:
+      case HotkeyCombo::CycleLimit:
         break;
       }
       off = std::clamp<int64_t>(off, -1'000'000'000LL, 1'000'000'000LL);

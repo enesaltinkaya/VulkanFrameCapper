@@ -145,7 +145,7 @@ features.
 
 Active in both modes. X11 and Wayland are supported. Hotkeys fire once when the combo is released, so holding the keys does not repeat.
 
-- `Shift + F9` toggles pacing on/off in both FPS and scanline modes.
+- `Shift + F9` cycles the limit preset in both modes: `120` → `60` → `0/off`.
 - **FPS mode:** `Shift + Plus/Minus` steps the cap by `0.01`;
   `Ctrl + Plus/Minus` steps by `0.10`.
 - **Scanline mode:** `Ctrl + Plus/Minus` moves the tearline target by `10` scanlines;

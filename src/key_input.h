@@ -11,6 +11,6 @@ bool increase_pressed();
 bool decrease_pressed();
 bool increase_fast_pressed();
 bool decrease_fast_pressed();
-bool toggle_limit_pressed();
+bool cycle_limit_pressed();
 
 } // namespace vfc::key_input
